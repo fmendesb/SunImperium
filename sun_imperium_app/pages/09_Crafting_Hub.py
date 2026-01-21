@@ -1,7 +1,7 @@
 # sun_imperium_app/pages/09_Crafting_Hub.py
 import streamlit as st
 
-from utils.supabase_client import get_supabase_client
+from utils.supabase_client import get_supabase
 from utils.crafting import (
     list_players,
     get_player_progress,
@@ -51,7 +51,7 @@ def _header():
     st.caption("Gather, discover recipes, craft, and manage inventory. (Test3-style UX, Supabase-backed)")
 
 
-sb = get_supabase_client()
+sb = get_supabase()
 _header()
 
 # ---------- Player selection ----------
