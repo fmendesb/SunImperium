@@ -35,7 +35,6 @@ refresh_vendor_stock_for_player = crafting.refresh_vendor_stock_for_player
 vendor_buy = crafting.vendor_buy
 max_tier_for_level = crafting.max_tier_for_level
 xp_required_for_level = crafting.xp_required_for_level
-)
 
 st.set_page_config(page_title="Crafting Hub", page_icon="🧰", layout="wide")
 st.title("🧰 Crafting Hub")
