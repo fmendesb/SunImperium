@@ -1,35 +1,40 @@
-# sun_imperium_app/pages/09_Crafting_Hub.py
 import streamlit as st
 from datetime import datetime, timezone
 
 from utils.supabase_client import get_supabase
-from utils.crafting import (
-    list_players,
-    ensure_player_progress,
-    set_skill_xp_delta,
-    get_activity_log,
-    list_inventory,
-    inventory_adjust,
-    transfer_item,
-    list_professions_for_player,
-    get_gather_professions,
-    roll_gathering_preview,
-    apply_gather_result,
-    profession_allows_duplicate_components,
-    discovery_attempt_preview,
-    apply_discovery_attempt,
-    list_known_recipes_for_player,
-    list_all_recipes,
-    craft_preview,
-    start_craft_job,
-    list_active_jobs,
-    claim_job_rewards,
-    get_current_week,
-    get_vendor_stock,
-    refresh_vendor_stock_for_player,
-    vendor_buy,
-    max_tier_for_level,
-    xp_required_for_level,
+
+# Import crafting utils with backwards-compatible fallbacks
+import utils.crafting as crafting
+
+ensure_player_progress = getattr(crafting, "ensure_player_progress", None) or getattr(crafting, "get_or_create_player_progress", None)
+if ensure_player_progress is None:
+    raise ImportError("utils.crafting must define ensure_player_progress (or get_or_create_player_progress)")
+
+list_players = crafting.list_players
+set_skill_xp_delta = crafting.set_skill_xp_delta
+get_activity_log = crafting.get_activity_log
+list_inventory = crafting.list_inventory
+inventory_adjust = crafting.inventory_adjust
+transfer_item = crafting.transfer_item
+list_professions_for_player = crafting.list_professions_for_player
+get_gather_professions = crafting.get_gather_professions
+roll_gathering_preview = crafting.roll_gathering_preview
+apply_gather_result = crafting.apply_gather_result
+profession_allows_duplicate_components = crafting.profession_allows_duplicate_components
+discovery_attempt_preview = crafting.discovery_attempt_preview
+apply_discovery_attempt = crafting.apply_discovery_attempt
+list_known_recipes_for_player = crafting.list_known_recipes_for_player
+list_all_recipes = crafting.list_all_recipes
+craft_preview = crafting.craft_preview
+start_craft_job = crafting.start_craft_job
+list_active_jobs = crafting.list_active_jobs
+claim_job_rewards = crafting.claim_job_rewards
+get_current_week = crafting.get_current_week
+get_vendor_stock = crafting.get_vendor_stock
+refresh_vendor_stock_for_player = crafting.refresh_vendor_stock_for_player
+vendor_buy = crafting.vendor_buy
+max_tier_for_level = crafting.max_tier_for_level
+xp_required_for_level = crafting.xp_required_for_level
 )
 
 st.set_page_config(page_title="Crafting Hub", page_icon="🧰", layout="wide")
