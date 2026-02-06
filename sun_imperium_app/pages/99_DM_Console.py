@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 st.set_page_config(page_title="DM Console", page_icon="🔮", layout="wide")
 
 sb = get_supabase()
-ensure_bootstrap(sb)
+try:
+    ensure_bootstrap(sb)
+except Exception:
+    st.error("Supabase connection hiccup. Refresh and try again.")
+    st.stop()
 week = get_current_week(sb)
 
 st.title("🔮 DM Console")
