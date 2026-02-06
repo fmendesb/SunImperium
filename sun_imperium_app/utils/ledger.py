@@ -13,13 +13,12 @@ class Totals:
 
 
 def get_current_week(sb: Client) -> int:
-    settings = sb.table("app_settings").select("current_week").limit(1).execute().data[0]
-    return int(settings["current_week"])
+    row = sb.table("app_state").select("current_week").eq("id", 1).execute().data[0]
+    return int(row["current_week"])
 
 
 def set_current_week(sb: Client, week: int) -> None:
-    row = sb.table("app_settings").select("id").limit(1).execute().data[0]
-    sb.table("app_settings").update({"current_week": week}).eq("id", row["id"]).execute()
+    sb.table("app_state").update({"current_week": week}).eq("id", 1).execute()
 
 
 def get_ledger_totals(sb: Client, week: int | None = None) -> Totals:
