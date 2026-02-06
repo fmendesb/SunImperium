@@ -2,6 +2,9 @@ import streamlit as st
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals
+from utils import economy
+
+
 
 st.set_page_config(page_title="Silver Council | Dashboard", page_icon="🏛️", layout="wide")
 
@@ -25,6 +28,25 @@ with c4:
     st.metric("Net (this week)", f"{tot.net:,.0f}")
 
 st.divider()
+
+# Economy snapshot (from last computed week)
+eco = sb.table("economy_week_summary").select(
+    "population,survival_ratio,player_payout,tax_income,gross_value"
+).eq("week", week).limit(1).execute().data
+
+if eco:
+    row = eco[0]
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        st.metric("Population", f"{int(row.get('population') or 0):,}")
+    with e2:
+        st.metric("Survival ratio", f"{float(row.get('survival_ratio') or 0):.2f}")
+    with e3:
+        st.metric("Tax income (total)", f"{float(row.get('tax_income') or 0):,.0f}")
+    with e4:
+        st.metric("Player payout", f"{float(row.get('player_payout') or 0):,.0f}")
+else:
+    st.warning("Economy not computed for this week yet. Use DM Console → Advance Week to generate income.")
 
 # Upkeep breakdown chips for this week
 wk_rows = sb.table("ledger_entries").select("category,direction,amount").eq("week", week).execute().data
