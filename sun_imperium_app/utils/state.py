@@ -1,34 +1,46 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from supabase import Client
 
 
 def ensure_bootstrap(sb: Client) -> None:
-    """Ensures minimum rows exist so the app can run."""
-    # app_settings single row
-    res = sb.table("app_settings").select("id,current_week").limit(1).execute()
-    if not res.data:
-        sb.table("app_settings").insert({"current_week": 1, "gold_starting": 0}).execute()
+    """Ensures minimum rows exist so the app can run.
 
-    settings = sb.table("app_settings").select("current_week").limit(1).execute().data[0]
-    week = int(settings["current_week"])
-    # ensure weeks row exists
-    wk = sb.table("weeks").select("week").eq("week", week).execute()
+    This project evolved over time; some older branches used `app_settings` and
+    `weeks.status`. The current canonical tables are:
+      - app_state(id smallint, current_week int, updated_at timestamptz)
+      - weeks(week int pk, opened_at timestamptz, closed_at timestamptz, note text)
+
+    This function only ensures these canonical tables have the minimum rows.
+    """
+
+    # app_state singleton row
+    r = sb.table("app_state").select("id,current_week").order("id").limit(1).execute()
+    if not r.data:
+        sb.table("app_state").insert({"id": 1, "current_week": 1, "updated_at": _now()}).execute()
+
+    current_week = int(sb.table("app_state").select("current_week").eq("id", 1).execute().data[0]["current_week"])
+
+    # Ensure weeks row exists
+    wk = sb.table("weeks").select("week").eq("week", current_week).execute()
     if not wk.data:
-        sb.table("weeks").insert({"week": week, "status": "open"}).execute()
+        sb.table("weeks").insert({"week": current_week, "opened_at": _now(), "note": "auto-seeded"}).execute()
 
-    # ensure ledger has opening balance entry if empty
+    # Ensure ledger has at least one row so dashboards don't crash
     led = sb.table("ledger_entries").select("id").limit(1).execute()
     if not led.data:
-        # opening balance = gold_starting
-        gs = float(settings.get("gold_starting", 0) or 0)
-        if gs != 0:
-            sb.table("ledger_entries").insert(
-                {
-                    "week": week,
-                    "direction": "in",
-                    "amount": gs,
-                    "category": "opening_balance",
-                    "note": "Opening balance",
-                }
-            ).execute()
+        sb.table("ledger_entries").insert(
+            {
+                "week": current_week,
+                "direction": "in",
+                "amount": 0,
+                "category": "bootstrap",
+                "note": "Bootstrap entry",
+                "metadata": {},
+            }
+        ).execute()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
