@@ -4,6 +4,39 @@ from dataclasses import dataclass
 from supabase import Client
 
 
+def _try_insert(sb: Client, payload: dict) -> None:
+    """Insert into ledger_entries with schema drift tolerance.
+
+    PostgREST rejects unknown columns, and older DBs may have only `meta`
+    while newer ones may have `metadata` (or both). We attempt a best-first
+    insert and retry with reduced payloads based on the error.
+    """
+
+    try:
+        sb.table("ledger_entries").insert(payload).execute()
+        return
+    except Exception as e:  # postgrest.exceptions.APIError or httpx errors
+        msg = str(e).lower()
+
+    # Retry without `metadata`
+    if "metadata" in payload and ("column" in msg and "metadata" in msg):
+        p2 = dict(payload)
+        p2.pop("metadata", None)
+        sb.table("ledger_entries").insert(p2).execute()
+        return
+
+    # Retry without `meta`
+    if "meta" in payload and ("column" in msg and "meta" in msg):
+        p2 = dict(payload)
+        p2.pop("meta", None)
+        sb.table("ledger_entries").insert(p2).execute()
+        return
+
+    # Last resort: try with only common fields
+    p3 = {k: payload[k] for k in ["week", "direction", "amount", "category", "note"] if k in payload}
+    sb.table("ledger_entries").insert(p3).execute()
+
+
 @dataclass
 class Totals:
     gold: float
@@ -63,7 +96,7 @@ def add_ledger_entry(
         "metadata": metadata or {},
         "meta": metadata or {},  # backward compat with early schema
     }
-    sb.table("ledger_entries").insert(payload).execute()
+    _try_insert(sb, payload)
 
 
 # Backwards-friendly alias
