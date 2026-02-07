@@ -6,6 +6,7 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
+from utils.navigation import sidebar_nav, PAGES
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="DM Console", page_icon="🔮", layout="wide")
@@ -17,11 +18,34 @@ except Exception:
     st.error("Supabase connection hiccup. Refresh and try again.")
     st.stop()
 week = get_current_week(sb)
+sidebar_nav(sb)
 
 st.title("🔮 DM Console")
 st.caption(f"Danger controls · Current week: {week}")
 
 st.divider()
+
+st.subheader("UI Visibility")
+st.caption("Hide or reveal tabs for players (useful for phased unlocks).")
+if dm_gate("Edit UI visibility", key="ui_vis"):
+    current = (
+        sb.table("app_state").select("ui_hidden_pages").eq("id", 1).limit(1).execute().data or [{}]
+    )[0].get("ui_hidden_pages") or []
+    if not isinstance(current, list):
+        current = []
+    page_keys = [k for (k, _label, _path) in PAGES if k != "dashboard"]
+    labels = {k: next(l for (kk, l, _p) in PAGES if kk == k) for k in page_keys}
+    chosen = st.multiselect(
+        "Hidden tabs",
+        options=page_keys,
+        default=[k for k in current if k in page_keys],
+        format_func=lambda k: labels.get(k, k),
+    )
+    if st.button("Save UI visibility"):
+        sb.table("app_state").update({"ui_hidden_pages": chosen}).eq("id", 1).execute()
+        st.success("Saved. Navigation will update on next reload.")
+else:
+    st.info("Locked.")
 
 st.subheader("Admin Event Log")
 st.caption("Last 50 actions across modules (best-effort log via activity_log).")
