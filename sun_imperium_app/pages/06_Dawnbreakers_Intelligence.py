@@ -13,12 +13,15 @@ from utils.equipment import (
 )
 from utils.missions import list_missions, create_mission, resolve_mission
 from utils.activity import log_activity
+from utils.infrastructure_effects import success_bonus_pct_for_category
+from utils.navigation import sidebar_nav
 
 
 st.set_page_config(page_title="Dawnbreakers | Intelligence", page_icon="🕵️", layout="wide")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 tot = compute_totals(sb, week=week)
 
@@ -211,9 +214,12 @@ with tab_missions:
                         assignment[e["id"]] = int(q)
 
         base_success = float(u.get("success") or 0.0)
-        bonus_success = compute_equipment_bonus_pct(equip_items, assignment)
+        infra_bonus = float(success_bonus_pct_for_category(sb, "intelligence"))
+        bonus_success = compute_equipment_bonus_pct(equip_items, assignment) + infra_bonus
         total_success = max(0.0, min(95.0, base_success + bonus_success))
-        st.info(f"Calculated success chance: **{total_success:.0f}%** (base {base_success:.0f}% + equipment {bonus_success:.0f}%)")
+        st.info(
+            f"Calculated success chance: **{total_success:.0f}%** (base {base_success:.0f}% + bonuses {bonus_success:.0f}% | infra {infra_bonus:.0f}% + equipment {(bonus_success-infra_bonus):.0f}%)"
+        )
 
         can_dispatch = available > 0 and target.strip() and objective.strip()
         if st.button("Dispatch mission", disabled=not can_dispatch):
