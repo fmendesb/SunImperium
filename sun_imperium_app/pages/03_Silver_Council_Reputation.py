@@ -5,6 +5,8 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils.dm import dm_gate
+from utils.reputation_rules import derive_dc_bonus
 
 UNDO_CATEGORY = "reputation"
 
@@ -38,6 +40,17 @@ factions = sb.table("factions").select("id,name,type").order("type").order("name
 reps = sb.table("reputation").select("id,faction_id,week,score,dc,bonus,note").eq("week", week).execute().data
 rep_by_faction = {r["faction_id"]: r for r in reps}
 
+st.subheader("Reputation")
+view = st.radio(
+    "Filter",
+    options=["All", "Regions", "Families"],
+    horizontal=True,
+)
+if view == "Regions":
+    factions = [f for f in factions if str(f.get("type")) == "region"]
+elif view == "Families":
+    factions = [f for f in factions if str(f.get("type")) in {"house", "family"}]
+
 if not factions:
     st.warning("No factions seeded yet. Seed `factions` table (from Excel or manually).")
     st.stop()
@@ -45,52 +58,63 @@ if not factions:
 rows = []
 for f in factions:
     r = rep_by_faction.get(f["id"])
+    score = int(r["score"]) if r else 0
+    derived = derive_dc_bonus(score)
     rows.append(
         {
-            "faction_id": f["id"],
             "name": f["name"],
             "type": f["type"],
-            "score": int(r["score"]) if r else 0,
-            "dc": int(r["dc"]) if r and r.get("dc") is not None else None,
-            "bonus": int(r["bonus"]) if r and r.get("bonus") is not None else None,
+            "score": score,
+            "dc": derived.dc,
+            "bonus": derived.bonus,
             "note": r.get("note") if r else "",
-            "reputation_id": r["id"] if r else None,
+            "_faction_id": f["id"],
+            "_reputation_id": r["id"] if r else None,
         }
     )
 
 df = pd.DataFrame(rows)
 
 st.subheader("Edit reputation scores")
-st.caption("Edit the score. Status thresholds/labels are derived elsewhere.")
+st.caption(
+    "Reputation scores are DM-controlled. DC and bonus are derived automatically from the score."
+)
+
+# Hide internal IDs from the UI, but keep them for saving.
+display_df = df.drop(columns=["_faction_id", "_reputation_id"])
 
 edited = st.data_editor(
-    df,
+    display_df,
     use_container_width=True,
     hide_index=True,
     column_config={
-        "faction_id": st.column_config.TextColumn("faction_id", disabled=True, width="small"),
-        "reputation_id": st.column_config.TextColumn("reputation_id", disabled=True, width="small"),
         "name": st.column_config.TextColumn("Name", disabled=True),
         "type": st.column_config.TextColumn("Type", disabled=True),
         "score": st.column_config.NumberColumn("Reputation", step=1),
-        "dc": st.column_config.NumberColumn("DC", step=1),
-        "bonus": st.column_config.NumberColumn("Bonus", step=1),
+        "dc": st.column_config.NumberColumn("DC", disabled=True),
+        "bonus": st.column_config.NumberColumn("Bonus", disabled=True),
         "note": st.column_config.TextColumn("Note"),
     },
     key="rep_editor",
 )
 
 if st.button("Save changes"):
+    if not dm_gate("DM password required to modify reputation", key="rep_save"):
+        st.stop()
+
     # Compare with original and upsert
-    for _, row in edited.iterrows():
-        fid = row["faction_id"]
-        rid = row["reputation_id"]
+    for idx, row in edited.iterrows():
+        fid = df.iloc[idx]["_faction_id"]
+        rid = df.iloc[idx]["_reputation_id"]
+
+        score = int(row["score"])
+        derived = derive_dc_bonus(score)
         payload = {
             "faction_id": fid,
             "week": week,
-            "score": int(row["score"]),
-            "dc": int(row["dc"]) if pd.notna(row["dc"]) else None,
-            "bonus": int(row["bonus"]) if pd.notna(row["bonus"]) else None,
+            "score": score,
+            "dc": derived.dc,
+            "bonus": derived.bonus,
             "note": str(row["note"] or ""),
         }
         if rid:
