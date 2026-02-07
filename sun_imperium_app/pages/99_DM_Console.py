@@ -6,7 +6,6 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
-from utils.navigation import sidebar_nav, PAGES
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="DM Console", page_icon="🔮", layout="wide")
@@ -17,36 +16,17 @@ try:
 except Exception:
     st.error("Supabase connection hiccup. Refresh and try again.")
     st.stop()
+
 week = get_current_week(sb)
-sidebar_nav(sb)
 
 st.title("🔮 DM Console")
 st.caption(f"Danger controls · Current week: {week}")
 
 st.divider()
 
-st.subheader("UI Visibility")
-st.caption("Hide or reveal tabs for players (useful for phased unlocks).")
-if dm_gate("Edit UI visibility", key="ui_vis"):
-    current = (
-        sb.table("app_state").select("ui_hidden_pages").eq("id", 1).limit(1).execute().data or [{}]
-    )[0].get("ui_hidden_pages") or []
-    if not isinstance(current, list):
-        current = []
-    page_keys = [k for (k, _label, _path) in PAGES if k != "dashboard"]
-    labels = {k: next(l for (kk, l, _p) in PAGES if kk == k) for k in page_keys}
-    chosen = st.multiselect(
-        "Hidden tabs",
-        options=page_keys,
-        default=[k for k in current if k in page_keys],
-        format_func=lambda k: labels.get(k, k),
-    )
-    if st.button("Save UI visibility"):
-        sb.table("app_state").update({"ui_hidden_pages": chosen}).eq("id", 1).execute()
-        st.success("Saved. Navigation will update on next reload.")
-else:
-    st.info("Locked.")
-
+# -------------------------
+# Admin Event Log
+# -------------------------
 st.subheader("Admin Event Log")
 st.caption("Last 50 actions across modules (best-effort log via activity_log).")
 try:
@@ -60,7 +40,7 @@ try:
         or []
     )
     if logs:
-        df = pd.DataFrame(
+        df_logs = pd.DataFrame(
             [
                 {
                     "Time": l.get("created_at"),
@@ -70,7 +50,7 @@ try:
                 for l in logs
             ]
         )
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df_logs, use_container_width=True, hide_index=True)
     else:
         st.info("No events logged yet.")
 except Exception:
@@ -78,7 +58,166 @@ except Exception:
 
 st.divider()
 
+# -------------------------
+# Player Visibility Controls
+# -------------------------
+st.subheader("Player Visibility Controls")
+
+if not dm_gate("DM password required to change visibility settings", key="visibility_gate"):
+    st.warning("Locked.")
+else:
+    tabs = st.tabs(["Hide Pages", "Hide Reputations (Factions)"])
+
+    # ---- Hide Pages ----
+    with tabs[0]:
+        st.caption(
+            "Hide or reveal sidebar pages for players. "
+            "This uses app_state.ui_hidden_pages (if present)."
+        )
+
+        # Safe best-effort: if app_state/ui_hidden_pages is not available, do not crash.
+        hidden_pages = []
+        try:
+            app_state = (
+                sb.table("app_state")
+                .select("id,ui_hidden_pages")
+                .eq("id", 1)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if app_state and isinstance(app_state[0].get("ui_hidden_pages"), list):
+                hidden_pages = app_state[0]["ui_hidden_pages"] or []
+        except Exception:
+            st.info("app_state.ui_hidden_pages not available in this schema yet.")
+            hidden_pages = []
+
+        # Enumerate known pages by file name (what Streamlit uses).
+        # If you have custom navigation elsewhere, this still remains the source of truth.
+        known_pages = [
+            "01_Silver_Council_Dashboard.py",
+            "02_Silver_Council_Infrastructure.py",
+            "03_Silver_Council_Reputation.py",
+            "04_Silver_Council_Legislation.py",
+            "05_Silver_Council_Diplomacy.py",
+            "06_Dawnbreakers_Intelligence.py",
+            "07_Moonblade_Guild_Military.py",
+            "08_War_Simulator.py",
+            "09_Crafting_Hub.py",
+            # DM Console intentionally excluded
+        ]
+
+        selected_hidden = st.multiselect(
+            "Pages hidden from players",
+            options=known_pages,
+            default=[p for p in known_pages if p in hidden_pages],
+            help="Players will not see these pages in the sidebar navigation (DM still can).",
+        )
+
+        if st.button("Save hidden pages", key="save_hidden_pages"):
+            try:
+                sb.table("app_state").upsert({"id": 1, "ui_hidden_pages": selected_hidden}).execute()
+                st.success("Saved page visibility.")
+            except Exception as e:
+                st.error(f"Could not save hidden pages. Schema missing? Error: {e}")
+
+    # ---- Hide Reputations (Factions) ----
+    with tabs[1]:
+        st.caption(
+            "Hide specific reputations from players by hiding the underlying faction. "
+            "Requires `factions.is_hidden` boolean column."
+        )
+
+        # Try loading factions with is_hidden, but do not crash if column not present.
+        try:
+            factions = (
+                sb.table("factions")
+                .select("id,name,type,is_hidden")
+                .order("type")
+                .order("name")
+                .execute()
+                .data
+                or []
+            )
+            has_is_hidden = True
+        except Exception:
+            # Fallback: column doesn't exist yet
+            factions = (
+                sb.table("factions")
+                .select("id,name,type")
+                .order("type")
+                .order("name")
+                .execute()
+                .data
+                or []
+            )
+            has_is_hidden = False
+
+        if not has_is_hidden:
+            st.warning(
+                "Missing column `factions.is_hidden`.\n\n"
+                "Run this SQL in Supabase first:\n"
+                "ALTER TABLE public.factions ADD COLUMN IF NOT EXISTS is_hidden boolean NOT NULL DEFAULT false;"
+            )
+        else:
+            # Optional quick filters for DM convenience
+            view = st.radio(
+                "Filter",
+                options=["All", "Regions", "Families"],
+                horizontal=True,
+                key="faction_hide_filter",
+            )
+
+            filtered = factions
+            if view == "Regions":
+                filtered = [f for f in factions if str(f.get("type")) == "region"]
+            elif view == "Families":
+                filtered = [f for f in factions if str(f.get("type")) in {"house", "family"}]
+
+            if not filtered:
+                st.info("No factions found for this filter.")
+            else:
+                df = pd.DataFrame(
+                    [
+                        {
+                            "Name": f.get("name"),
+                            "Type": f.get("type"),
+                            "Hidden from players": bool(f.get("is_hidden")),
+                            "_id": f.get("id"),
+                        }
+                        for f in filtered
+                    ]
+                )
+
+                edited = st.data_editor(
+                    df.drop(columns=["_id"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Name": st.column_config.TextColumn(disabled=True),
+                        "Type": st.column_config.TextColumn(disabled=True),
+                        "Hidden from players": st.column_config.CheckboxColumn(),
+                    },
+                    key="faction_hide_editor",
+                )
+
+                if st.button("Save reputation visibility", key="save_rep_visibility"):
+                    # Apply updates row by row (safe, easy to audit)
+                    try:
+                        for i, row in edited.iterrows():
+                            faction_id = df.iloc[i]["_id"]
+                            desired_hidden = bool(row["Hidden from players"])
+                            sb.table("factions").update({"is_hidden": desired_hidden}).eq("id", faction_id).execute()
+                        st.success("Saved reputation visibility.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to save changes: {e}")
+
+st.divider()
+
+# -------------------------
 # Advance week
+# -------------------------
 st.subheader("Advance Week")
 
 wk_row = sb.table("weeks").select("closed_at").eq("week", week).limit(1).execute().data
@@ -168,10 +307,12 @@ else:
         # close week, increment
         sb.table("weeks").update({"closed_at": datetime.now(timezone.utc).isoformat()}).eq("week", week).execute()
         next_week = week + 1
+
         # open next week if missing
         wk = sb.table("weeks").select("week").eq("week", next_week).execute().data
         if not wk:
             sb.table("weeks").insert({"week": next_week, "opened_at": datetime.now(timezone.utc).isoformat(), "note": "auto-opened"}).execute()
+
         set_current_week(sb, next_week)
 
         # carry forward reputation scores (factions table)
@@ -190,14 +331,12 @@ else:
                 ).execute()
 
         # carry forward region/family week state (so DM tweaks are per-week)
-        for tbl, keycol in [("region_week_state", "region"), ("family_week_state", "family")]:
+        for tbl in ["region_week_state", "family_week_state"]:
             rows = sb.table(tbl).select("*").eq("week", week).execute().data or []
             for row in rows:
                 row2 = dict(row)
                 row2["week"] = next_week
-                # remove PK-only columns if present
                 sb.table(tbl).upsert(row2).execute()
 
         st.success(f"Advanced to Week {next_week}.")
         st.rerun()
-
