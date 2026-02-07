@@ -5,6 +5,7 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.undo import log_action, get_last_action, pop_last_action
 from utils.dm import dm_gate
+from utils.navigation import sidebar_nav
 
 UNDO_CATEGORY = "legislation"
 
@@ -12,6 +13,7 @@ st.set_page_config(page_title="Silver Council | Legislation", page_icon="📜", 
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 
 st.title("📜 Legislation")
 st.caption("The Silver Council Codex")
@@ -41,6 +43,11 @@ st.dataframe(df, use_container_width=True, hide_index=True)
 
 st.divider()
 st.subheader("Add / Update Law")
+
+# Require DM unlock BEFORE the user hits Save, otherwise Streamlit forms
+# feel "broken" (submission happens, then we stop mid-rerun).
+can_edit = dm_gate("Unlock to add/update legislation", key="leg_unlock")
+
 with st.form("law_form", clear_on_submit=False):
     c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     with c1:
@@ -57,9 +64,11 @@ with st.form("law_form", clear_on_submit=False):
     effects = st.text_area("Effects (free text for now)", value="")
     active = st.checkbox("Active", value=True)
 
-    submitted = st.form_submit_button("Save")
+    submitted = st.form_submit_button("Save", disabled=not can_edit)
     if submitted:
-        if not dm_gate("DM password required to edit legislation", key="leg_save"):
+        # Gate already validated above; keep this as a defensive check.
+        if not can_edit:
+            st.error("DM password required to add/update legislation.")
             st.stop()
         ins = (
             sb.table("legislation")
