@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
@@ -22,8 +23,44 @@ st.caption(f"Danger controls · Current week: {week}")
 
 st.divider()
 
+st.subheader("Admin Event Log")
+st.caption("Last 50 actions across modules (best-effort log via activity_log).")
+try:
+    logs = (
+        sb.table("activity_log")
+        .select("created_at,kind,message,meta")
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+        .data
+        or []
+    )
+    if logs:
+        df = pd.DataFrame(
+            [
+                {
+                    "Time": l.get("created_at"),
+                    "Kind": l.get("kind"),
+                    "Message": l.get("message"),
+                }
+                for l in logs
+            ]
+        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No events logged yet.")
+except Exception:
+    st.info("activity_log table not available in this schema.")
+
+st.divider()
+
 # Advance week
 st.subheader("Advance Week")
+
+wk_row = sb.table("weeks").select("closed_at").eq("week", week).limit(1).execute().data
+already_closed = bool(wk_row and wk_row[0].get("closed_at"))
+if already_closed:
+    st.warning("This week is already marked closed. If you need to advance again, reopen the week manually in Supabase.")
 
 if not dm_gate("Advance Week", key="advance_week"):
     st.warning("Locked.")
@@ -32,7 +69,7 @@ else:
 
     manual_income = st.number_input("Manual income adjustment (optional, adds to payout)", value=0.0, step=10.0)
 
-    if st.button("✅ Advance Week", type="primary"):
+    if st.button("✅ Advance Week", type="primary", disabled=already_closed):
         # Compute upkeep from current owned assets
         infra_upkeep = 0.0
         owned_infra = sb.table("infrastructure_owned").select("infrastructure_id,owned").eq("owned", True).execute().data
@@ -139,3 +176,4 @@ else:
 
         st.success(f"Advanced to Week {next_week}.")
         st.rerun()
+
