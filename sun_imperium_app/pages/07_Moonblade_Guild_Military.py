@@ -61,7 +61,7 @@ else:
         with st.container(border=True):
             left, right = st.columns([3, 1])
             with left:
-                st.write(f"**{u['name']}** ({u['unit_type']})")
+                st.write(f"**{u['name']}**")
                 st.caption(u.get("description") or "")
                 st.write(f"Cost: {float(u['cost']):,.0f} · Upkeep: {float(u.get('upkeep') or 0):,.0f} · Power: {float(u.get('power') or 0):,.0f}")
                 st.write(f"Owned: {roster_map.get(u['id'], 0)}")
@@ -97,7 +97,7 @@ with st.form("create_squad", clear_on_submit=True):
 if not squads:
     st.info("No squads yet. Create one above.")
 else:
-    squad_options = {f"{s['name']} ({s.get('region') or 'Unassigned'})": s for s in squads}
+    squad_options = {s['name']: s for s in squads}
     label = st.selectbox("Select squad", list(squad_options.keys()))
     squad = squad_options[label]
 
@@ -112,7 +112,7 @@ else:
         u = unit_by_id.get(m["unit_id"])
         if not u:
             continue
-        mrows.append({"Member ID": m["id"], "Unit": u["name"], "Type": u["unit_type"], "Qty": int(m["quantity"])})
+        mrows.append({"Member ID": m["id"], "Unit": u["name"], "Qty": int(m["quantity"])})
     if mrows:
         st.dataframe(pd.DataFrame(mrows), use_container_width=True)
     else:
