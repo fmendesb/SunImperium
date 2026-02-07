@@ -15,6 +15,8 @@ from utils.equipment import (
 )
 from utils.missions import list_missions, create_mission, resolve_mission
 from utils.activity import log_activity
+from utils.infrastructure_effects import success_bonus_pct_for_category
+from utils.navigation import sidebar_nav
 
 
 UNDO_CATEGORY = "diplomacy"
@@ -23,6 +25,7 @@ st.set_page_config(page_title="Silver Council | Diplomacy", page_icon="🤝", la
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 
 tot = compute_totals(sb, week=week)
@@ -208,14 +211,29 @@ with tab_missions:
         st.warning("Seed diplomacy units first.")
         st.stop()
 
-    unit_options = {u["name"]: u for u in units}
+    # Only show unit types that have at least 1 available this week
+    avail_rows = []
+    for u in units:
+        owned_qty = int(roster_map.get(u["id"], {}).get("quantity", 0))
+        available = max(0, owned_qty - int(active_assigned.get(u["id"], 0)))
+        if available > 0:
+            avail_rows.append(u)
+    unit_pool = avail_rows if avail_rows else units
+    unit_options = {u["name"]: u for u in unit_pool}
     with st.expander("➕ Create mission", expanded=True):
         u_name = st.selectbox("Unit type", list(unit_options.keys()))
         u = unit_options[u_name]
         owned_qty = int(roster_map.get(u["id"], {}).get("quantity", 0))
         available = max(0, owned_qty - int(active_assigned.get(u["id"], 0)))
 
-        qty = st.number_input("Quantity to dispatch", min_value=1, max_value=max(1, available), value=1, step=1, disabled=available <= 0)
+        qty = st.number_input(
+            "Quantity to dispatch",
+            min_value=1,
+            max_value=max(1, available),
+            value=1,
+            step=1,
+            disabled=available <= 0,
+        )
         target = st.text_input("Target (region/faction)", value="")
         objective = st.text_area("Objective", value="")
         eta_week = st.number_input("Suggested return week (DM can change)", min_value=week, value=week, step=1)
@@ -240,9 +258,12 @@ with tab_missions:
                         assignment[e["id"]] = int(q)
 
         base_success = float(u.get("success") or 0.0)
-        bonus_success = compute_equipment_bonus_pct(equip_items, assignment)
+        infra_bonus = float(success_bonus_pct_for_category(sb, "diplomacy"))
+        bonus_success = compute_equipment_bonus_pct(equip_items, assignment) + infra_bonus
         total_success = max(0.0, min(95.0, base_success + bonus_success))
-        st.info(f"Calculated success chance: **{total_success:.0f}%** (base {base_success:.0f}% + equipment {bonus_success:.0f}%)")
+        st.info(
+            f"Calculated success chance: **{total_success:.0f}%** (base {base_success:.0f}% + bonuses {bonus_success:.0f}% | infra {infra_bonus:.0f}% + equipment {(bonus_success-infra_bonus):.0f}%)"
+        )
 
         can_dispatch = available > 0 and target.strip() and objective.strip()
         if st.button("Dispatch mission", disabled=not can_dispatch):
