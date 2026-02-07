@@ -32,8 +32,14 @@ def get_settings(sb) -> Dict[str, float]:
     """Read economy settings. Must exist via SQL seed."""
     r = sb.table("economy_settings").select("tax_rate,player_share,economy_scale,rand_min,rand_max").limit(1).execute()
     if not r.data:
-        # safe fallback
-        return {"tax_rate": 0.10, "player_share": 0.20, "economy_scale": 1.0, "rand_min": 0.90, "rand_max": 1.10}
+        # Safe fallback: conservative by default to avoid runaway payouts.
+        return {
+            "tax_rate": 0.10,
+            "player_share": 0.20,
+            "economy_scale": 0.0001,
+            "rand_min": 0.90,
+            "rand_max": 1.10,
+        }
     row = r.data[0]
     return {
         "tax_rate": float(row.get("tax_rate") or 0.10),
@@ -117,7 +123,19 @@ def region_multiplier(sb, week: int, region: str) -> float:
 
 
 def family_multiplier(sb, week: int, family: str) -> float:
-    r = sb.table("family_week_state").select("reputation_score,dm_modifier").eq("week", week).eq("family", family).limit(1).execute()
+    # Some installations may not have family_week_state yet.
+    # Treat as neutral multiplier rather than breaking the app.
+    try:
+        r = (
+            sb.table("family_week_state")
+            .select("reputation_score,dm_modifier")
+            .eq("week", week)
+            .eq("family", family)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        return 1.0
     if not r.data:
         return 1.0
     row = r.data[0]
@@ -143,9 +161,15 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
     rand_min, rand_max = settings["rand_min"], settings["rand_max"]
     scale = settings["economy_scale"]
 
-    items = sb.table("gathering_items").select(
-        "name,rarity,base_price_gp,region,family"
-    ).execute().data or []
+    # NOTE: Some datasets may not have reliable rarity filled out.
+    # We also fetch tier and derive rarity when missing.
+    items = (
+        sb.table("gathering_items")
+        .select("name,rarity,tier,base_price_gp,region,family")
+        .execute()
+        .data
+        or []
+    )
 
     per_item: List[Dict[str, Any]] = []
     gross_value = 0.0
@@ -155,6 +179,21 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
     for it in items:
         name = it["name"]
         rarity = (it.get("rarity") or "").strip()
+        tier = int(it.get("tier") or 1)
+
+        if not rarity:
+            # Heuristic mapping: higher tiers tend to be rarer.
+            # This prevents all items defaulting to the same production rate.
+            if tier <= 1:
+                rarity = "Common"
+            elif tier == 2:
+                rarity = "Uncommon"
+            elif tier in (3, 4):
+                rarity = "Rare"
+            elif tier in (5, 6):
+                rarity = "Very Rare"
+            else:
+                rarity = "Legendary"
         base_price = float(it.get("base_price_gp") or 0)
         region = (it.get("region") or "").strip()
         family = (it.get("family") or "").strip()
@@ -165,7 +204,8 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
         elif name.lower() in {"lunar grain", "lunar grain (t1)", "grain"}:
             prod_rate = GRAIN_PER_CAPITA
         else:
-            prod_rate = float(rates.get(rarity, 0.00008))  # fallback ~uncommon
+            # Fallback is deliberately conservative.
+            prod_rate = float(rates.get(rarity, 0.00002))
 
         rm = region_multiplier(sb, week, region) if region else 1.0
         fm = family_multiplier(sb, week, family) if family else 1.0
