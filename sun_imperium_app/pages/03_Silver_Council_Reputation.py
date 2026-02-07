@@ -7,6 +7,7 @@ from utils.ledger import get_current_week
 from utils.undo import log_action, get_last_action, pop_last_action
 from utils.dm import dm_gate
 from utils.reputation_rules import derive_dc_bonus
+from utils.navigation import sidebar_nav
 
 UNDO_CATEGORY = "reputation"
 
@@ -14,6 +15,7 @@ st.set_page_config(page_title="Silver Council | Reputation", page_icon="🗳️"
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 
 st.title("🗳️ The Silver Council")
