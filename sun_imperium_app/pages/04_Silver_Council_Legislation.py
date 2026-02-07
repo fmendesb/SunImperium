@@ -4,6 +4,7 @@ import pandas as pd
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils.dm import dm_gate
 
 UNDO_CATEGORY = "legislation"
 
@@ -58,6 +59,8 @@ with st.form("law_form", clear_on_submit=False):
 
     submitted = st.form_submit_button("Save")
     if submitted:
+        if not dm_gate("DM password required to edit legislation", key="leg_save"):
+            st.stop()
         ins = (
             sb.table("legislation")
             .insert(
