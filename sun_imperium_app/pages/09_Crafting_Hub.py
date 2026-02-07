@@ -2,12 +2,16 @@ import streamlit as st
 from datetime import datetime, timezone
 
 from utils.supabase_client import get_supabase
+from utils.state import ensure_bootstrap
+from utils.navigation import sidebar_nav
 import utils.crafting as crafting
 
 st.set_page_config(page_title="Crafting Hub", page_icon="🧰", layout="wide")
 st.title("🧰 Crafting Hub")
 
 sb = get_supabase()
+ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = crafting.get_current_week(sb)
 
 players = crafting.list_players(sb)
