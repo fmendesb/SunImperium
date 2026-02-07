@@ -8,7 +8,7 @@ from utils.undo import log_action, get_last_action, pop_last_action
 
 UNDO_CATEGORY = "infrastructure"
 
-st.set_page_config(page_title="Silver Council | Infrastructure", page_icon="🏗️", layout="wide")
+st.set_page_config(page_title="Silver Council | Shop", page_icon="🏪", layout="wide")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
@@ -16,8 +16,8 @@ week = get_current_week(sb)
 
 tot = compute_totals(sb, week=week)
 
-st.title("🏗️ Silver Council Holdings")
-st.caption(f"Infrastructure · Week {week} · Moonvault: {tot.gold:,.0f} gold")
+st.title("🏪 Silver Council Shop")
+st.caption(f"Shop · Week {week} · Moonvault: {tot.gold:,.0f} gold")
 
 # Undo last infrastructure purchase
 with st.popover("↩️ Undo (Infrastructure)"):
@@ -48,6 +48,20 @@ st.divider()
 infra = sb.table("infrastructure").select("id,name,category,cost,upkeep,description,prereq").order("category").order("name").execute().data
 owned_rows = sb.table("infrastructure_owned").select("infrastructure_id,owned").execute().data
 owned_map = {r["infrastructure_id"]: bool(r["owned"]) for r in owned_rows}
+
+# Helper: resolve prereq name -> owned status
+name_to_id = {row["name"]: row["id"] for row in (infra or [])}
+
+
+def prereq_met(prereq_name: str) -> bool:
+    prereq_name = (prereq_name or "").strip()
+    if not prereq_name:
+        return True
+    pid = name_to_id.get(prereq_name)
+    if not pid:
+        # If the prereq name doesn't resolve, fail closed (can't buy) so tier chains stay safe.
+        return False
+    return bool(owned_map.get(pid, False))
 
 if not infra:
     st.warning("No infrastructure seeded yet. Seed `infrastructure` table (from Excel or manually).")
@@ -90,7 +104,10 @@ for _, r in df.iterrows():
         with right:
             owned = r["Owned"] == "Yes"
             st.write(f"**Owned:** {'✅' if owned else '❌'}")
-            can_buy = (not owned) and (tot.gold >= float(r["Cost"]))
+            prereq_ok = prereq_met(r["Prereq"])
+            can_buy = (not owned) and prereq_ok and (tot.gold >= float(r["Cost"]))
+            if (not prereq_ok) and r["Prereq"]:
+                st.caption("🔒 Locked until prerequisite is owned.")
             if st.button("Purchase", key=f"buy_{r['id']}", disabled=not can_buy):
                 # Mark owned + deduct gold via ledger
                 sb.table("infrastructure_owned").upsert({"infrastructure_id": r["id"], "owned": True}).execute()
