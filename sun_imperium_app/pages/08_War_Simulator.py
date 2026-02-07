@@ -6,6 +6,8 @@ from utils.ledger import get_current_week
 from utils.dm import dm_gate
 from utils.undo import log_action
 from utils.war import Force, simulate_battle
+from utils.infrastructure_effects import power_bonus_for_unit_type
+from utils.navigation import sidebar_nav
 
 UNDO_CATEGORY = "war"
 
@@ -13,6 +15,7 @@ st.set_page_config(page_title="War Simulator", page_icon="🩸", layout="wide")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 
 st.title("🩸 War Simulator")
@@ -30,8 +33,49 @@ squad_choice = st.selectbox(
     format_func=lambda r: f"{r['name']}",
 )
 
-members = sb.table("squad_members").select("unit_type,quantity").eq("squad_id", squad_choice["id"]).execute().data
+members = (
+    sb.table("squad_members")
+    .select("unit_type,unit_id,quantity")
+    .eq("squad_id", squad_choice["id"])
+    .execute()
+    .data
+)
 ally = Force.from_rows(members)
+
+# Compute per-type weights from the squad's actual unit power (moonblade_units.power)
+# plus owned infrastructure power boosts (+1/+2/+3 per tier chain).
+unit_ids = [m.get("unit_id") for m in (members or []) if m.get("unit_id")]
+unit_powers = {}
+if unit_ids:
+    # fetch in chunks (supabase 'in' can be finicky on long lists)
+    rows = sb.table("moonblade_units").select("id,unit_type,power").in_("id", unit_ids).execute().data or []
+    unit_powers = {r["id"]: (str(r.get("unit_type") or "others").lower(), float(r.get("power") or 0.0)) for r in rows}
+
+weights: dict[str, float] = {}
+totals: dict[str, float] = {"guardian": 0.0, "archer": 0.0, "mage": 0.0, "cleric": 0.0, "others": 0.0}
+counts: dict[str, int] = {k: 0 for k in totals}
+for m in (members or []):
+    t = str(m.get("unit_type") or "others").lower()
+    q = int(m.get("quantity") or 0)
+    if t not in totals:
+        t = "others"
+    # Prefer explicit unit power when unit_id is present
+    power = 0.0
+    uid = m.get("unit_id")
+    if uid and uid in unit_powers:
+        t_from_id, p = unit_powers[uid]
+        t = t_from_id or t
+        power = p
+    if power <= 0:
+        power = 1.0
+    # Apply infrastructure power bonus per unit type
+    power += float(power_bonus_for_unit_type(sb, t))
+    totals[t] += power * max(0, q)
+    counts[t] += max(0, q)
+
+for t, total_power in totals.items():
+    if counts[t] > 0:
+        weights[t] = total_power / float(counts[t])
 
 st.subheader("Friendly force")
 colA, colB, colC, colD, colE = st.columns(5)
@@ -65,7 +109,7 @@ enemy = Force(
 )
 
 if st.button("Resolve battle"):
-    result = simulate_battle(ally, enemy)
+    result = simulate_battle(ally, enemy, ally_weights=weights)
     st.session_state["war_result"] = result
 
 result = st.session_state.get("war_result")
@@ -101,16 +145,28 @@ if result:
             # Update squad members to remaining
             remaining = result.ally_remaining.as_dict()
             for unit_type, qty in remaining.items():
-                sb.table("squad_members").upsert(
-                    {"squad_id": squad_choice["id"], "unit_type": unit_type, "quantity": int(qty)}
-                ).execute()
+                existing = (
+                    sb.table("squad_members")
+                    .select("id")
+                    .eq("squad_id", squad_choice["id"])
+                    .eq("unit_type", unit_type)
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                if existing:
+                    sb.table("squad_members").update({"quantity": int(qty)}).eq("id", existing[0]["id"]).execute()
+                else:
+                    sb.table("squad_members").insert(
+                        {"squad_id": squad_choice["id"], "unit_type": unit_type, "quantity": int(qty)}
+                    ).execute()
 
             # Record war log
             sb.table("wars").insert(
                 {
                     "week": week,
                     "squad_id": squad_choice["id"],
-                    "enemy_force": enemy.as_dict(),
+                    "enemy": enemy.as_dict(),
                     "result": {
                         "winner": result.winner,
                         "ally_power": result.ally_power,
