@@ -5,6 +5,7 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils.navigation import sidebar_nav
 
 UNDO_CATEGORY = "moonblade"
 
@@ -12,6 +13,7 @@ st.set_page_config(page_title="Moonblade Guild | Military", page_icon="⚔️", 
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 tot = compute_totals(sb, week=week)
 
@@ -53,50 +55,73 @@ units = sb.table("moonblade_units").select("id,name,unit_type,power,cost,upkeep,
 roster_rows = sb.table("moonblade_roster").select("unit_id,quantity").execute().data
 roster_map = {r["unit_id"]: int(r["quantity"]) for r in roster_rows}
 
-st.subheader("Recruitment")
-if not units:
-    st.warning("No Moonblade units seeded yet. Seed `moonblade_units` from Excel.")
-else:
-    for u in units:
-        with st.container(border=True):
-            left, right = st.columns([3, 1])
-            with left:
-                st.write(f"**{u['name']}**")
-                st.caption(u.get("description") or "")
-                st.write(f"Cost: {float(u['cost']):,.0f} · Upkeep: {float(u.get('upkeep') or 0):,.0f} · Power: {float(u.get('power') or 0):,.0f}")
-                st.write(f"Owned: {roster_map.get(u['id'], 0)}")
-            with right:
-                qty = st.number_input("Qty", min_value=1, max_value=999, value=1, key=f"qty_{u['id']}")
-                total_cost = float(u['cost']) * int(qty)
-                if st.button("Recruit", key=f"recruit_{u['id']}", disabled=tot.gold < total_cost):
-                    new_qty = roster_map.get(u['id'], 0) + int(qty)
-                    sb.table("moonblade_roster").upsert({"unit_id": u['id'], "quantity": new_qty}).execute()
-                    add_ledger_entry(sb, week=week, direction="out", amount=total_cost, category="moonblade_recruit", note=f"Recruited {qty}x {u['name']}", metadata={"unit_id": u['id'], "qty": int(qty)})
-                    log_action(sb, category=UNDO_CATEGORY, action="recruit_unit", payload={"unit_id": u['id'], "qty": int(qty), "cost": total_cost, "name": u['name']})
-                    st.success("Recruited.")
-                    st.rerun()
+tab_units, tab_squads = st.tabs(["Units", "Squads"])
 
-st.divider()
 
-# Squads
-st.subheader("Squads")
-squads = sb.table("squads").select("id,name,region").order("name").execute().data
+with tab_units:
+    st.subheader("Recruitment")
+    if not units:
+        st.warning("No Moonblade units seeded yet. Seed `moonblade_units` from Excel.")
+    else:
+        # Filter / jump list by unit type
+        type_opts = sorted({str(u.get("unit_type") or "other") for u in units})
+        sel_type = st.selectbox("Filter by unit type", options=["All"] + type_opts, index=0)
+        show_units = units if sel_type == "All" else [u for u in units if str(u.get("unit_type")) == sel_type]
 
-with st.form("create_squad", clear_on_submit=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        squad_name = st.text_input("New squad name")
-    with c2:
-        region = st.text_input("Region (e.g., New Triport)")
-    if st.form_submit_button("Create squad"):
-        if squad_name:
-            sb.table("squads").insert({"name": squad_name, "region": region}).execute()
-            st.success("Squad created.")
-            st.rerun()
+        for u in show_units:
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+                with left:
+                    st.write(f"**{u['name']}**")
+                    st.caption(u.get("description") or "")
+                    st.write(
+                        f"Cost: {float(u['cost']):,.0f} · Upkeep: {float(u.get('upkeep') or 0):,.0f} · Power: {float(u.get('power') or 0):,.0f}"
+                    )
+                    st.write(f"Owned: {roster_map.get(u['id'], 0)}")
+                with right:
+                    qty = st.number_input("Qty", min_value=1, max_value=999, value=1, key=f"qty_{u['id']}")
+                    total_cost = float(u['cost']) * int(qty)
+                    if st.button("Recruit", key=f"recruit_{u['id']}", disabled=tot.gold < total_cost):
+                        new_qty = roster_map.get(u['id'], 0) + int(qty)
+                        sb.table("moonblade_roster").upsert({"unit_id": u['id'], "quantity": new_qty}).execute()
+                        add_ledger_entry(
+                            sb,
+                            week=week,
+                            direction="out",
+                            amount=total_cost,
+                            category="moonblade_recruit",
+                            note=f"Recruited {qty}x {u['name']}",
+                            metadata={"unit_id": u['id'], "qty": int(qty)},
+                        )
+                        log_action(
+                            sb,
+                            category=UNDO_CATEGORY,
+                            action="recruit_unit",
+                            payload={"unit_id": u['id'], "qty": int(qty), "cost": total_cost, "name": u['name']},
+                        )
+                        st.success("Recruited.")
+                        st.rerun()
 
-if not squads:
-    st.info("No squads yet. Create one above.")
-else:
+with tab_squads:
+    st.subheader("Squads")
+    squads = sb.table("squads").select("id,name,region").order("name").execute().data
+
+    with st.form("create_squad", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            squad_name = st.text_input("New squad name")
+        with c2:
+            region = st.text_input("Region (e.g., New Triport)")
+        if st.form_submit_button("Create squad"):
+            if squad_name:
+                sb.table("squads").insert({"name": squad_name, "region": region}).execute()
+                st.success("Squad created.")
+                st.rerun()
+
+    if not squads:
+        st.info("No squads yet. Create one above.")
+        st.stop()
+
     squad_options = {s['name']: s for s in squads}
     label = st.selectbox("Select squad", list(squad_options.keys()))
     squad = squad_options[label]
@@ -104,7 +129,13 @@ else:
     st.write(f"**{squad['name']}** · Region: {squad.get('region') or '—'}")
 
     # Squad members
-    members = sb.table("squad_members").select("id,unit_id,quantity").eq("squad_id", squad["id"]).execute().data
+    members = (
+        sb.table("squad_members")
+        .select("id,unit_id,unit_type,quantity")
+        .eq("squad_id", squad["id"])
+        .execute()
+        .data
+    )
     unit_by_id = {u["id"]: u for u in units}
 
     mrows = []
@@ -145,7 +176,14 @@ else:
             if existing:
                 sb.table("squad_members").update({"quantity": int(existing[0]["quantity"]) + int(qty_add)}).eq("id", existing[0]["id"]).execute()
             else:
-                sb.table("squad_members").insert({"squad_id": squad["id"], "unit_id": chosen["id"], "quantity": int(qty_add)}).execute()
+                sb.table("squad_members").insert(
+                    {
+                        "squad_id": squad["id"],
+                        "unit_id": chosen["id"],
+                        "unit_type": chosen["unit_type"],
+                        "quantity": int(qty_add),
+                    }
+                ).execute()
 
             st.success("Assigned.")
             st.rerun()
