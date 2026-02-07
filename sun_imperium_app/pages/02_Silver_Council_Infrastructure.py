@@ -5,6 +5,8 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils.infrastructure_effects import effect_for_infrastructure, prereq_name_for_infrastructure
+from utils.navigation import sidebar_nav
 
 UNDO_CATEGORY = "infrastructure"
 
@@ -12,6 +14,7 @@ st.set_page_config(page_title="Silver Council | Shop", page_icon="🏪", layout=
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+sidebar_nav(sb)
 week = get_current_week(sb)
 
 tot = compute_totals(sb, week=week)
@@ -53,15 +56,24 @@ owned_map = {r["infrastructure_id"]: bool(r["owned"]) for r in owned_rows}
 name_to_id = {row["name"]: row["id"] for row in (infra or [])}
 
 
-def prereq_met(prereq_name: str) -> bool:
-    prereq_name = (prereq_name or "").strip()
+def _owned_by_name(name: str) -> bool:
+    pid = name_to_id.get((name or "").strip())
+    return bool(pid and owned_map.get(pid, False))
+
+
+def prereq_met(row: dict) -> bool:
+    """Return True if the prerequisite is owned.
+
+    We support:
+    - explicit infrastructure.prereq (string name)
+    - inferred prereqs based on canonical name chains (from design docs)
+    """
+    explicit = (row.get("prereq") or "").strip()
+    inferred = prereq_name_for_infrastructure(row.get("name") or "")
+    prereq_name = explicit or inferred or ""
     if not prereq_name:
         return True
-    pid = name_to_id.get(prereq_name)
-    if not pid:
-        # If the prereq name doesn't resolve, fail closed (can't buy) so tier chains stay safe.
-        return False
-    return bool(owned_map.get(pid, False))
+    return _owned_by_name(prereq_name)
 
 if not infra:
     st.warning("No infrastructure seeded yet. Seed `infrastructure` table (from Excel or manually).")
@@ -99,14 +111,26 @@ for _, r in df.iterrows():
             st.subheader(r["Name"])
             st.write(r["Description"])
             st.write(f"**Cost:** {r['Cost']:,.0f} · **Upkeep:** {r['Upkeep']:,.0f}")
-            if r["Prereq"]:
-                st.caption(f"Prerequisite: {r['Prereq']}")
+            # Benefits (explicit)
+            eff = effect_for_infrastructure(r["Name"])
+            if eff:
+                if eff.unit == "%":
+                    st.write(f"**Benefits:** +{eff.value:g}{eff.unit} to {eff.target} success")
+                elif eff.unit == "x":
+                    st.write(f"**Benefits:** {eff.value:g}{eff.unit} {eff.target}")
+                elif eff.kind == "social_bonus":
+                    st.write(f"**Benefits:** +{eff.value:g} Social Status")
+                elif eff.kind == "power_bonus":
+                    st.write(f"**Benefits:** +{eff.value:g} Power Level to {eff.target.title()} units")
+            prereq_label = (r["Prereq"] or prereq_name_for_infrastructure(r["Name"]) or "").strip()
+            if prereq_label:
+                st.caption(f"Prerequisite: {prereq_label}")
         with right:
             owned = r["Owned"] == "Yes"
             st.write(f"**Owned:** {'✅' if owned else '❌'}")
-            prereq_ok = prereq_met(r["Prereq"])
+            prereq_ok = prereq_met({"name": r["Name"], "prereq": r["Prereq"]})
             can_buy = (not owned) and prereq_ok and (tot.gold >= float(r["Cost"]))
-            if (not prereq_ok) and r["Prereq"]:
+            if (not prereq_ok) and (r["Prereq"] or prereq_name_for_infrastructure(r["Name"])):
                 st.caption("🔒 Locked until prerequisite is owned.")
             if st.button("Purchase", key=f"buy_{r['id']}", disabled=not can_buy):
                 # Mark owned + deduct gold via ledger
