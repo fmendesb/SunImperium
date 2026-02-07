@@ -54,16 +54,16 @@ def add_ledger_entry(
     note: str = "",
     metadata: dict | None = None,
 ) -> None:
-    sb.table("ledger_entries").insert(
-        {
-            "week": week,
-            "direction": direction,
-            "amount": amount,
-            "category": category,
-            "note": note,
-            "metadata": metadata or {},
-        }
-    ).execute()
+    payload = {
+        "week": week,
+        "direction": direction,
+        "amount": amount,
+        "category": category,
+        "note": note,
+        "metadata": metadata or {},
+        "meta": metadata or {},  # backward compat with early schema
+    }
+    sb.table("ledger_entries").insert(payload).execute()
 
 
 # Backwards-friendly alias
