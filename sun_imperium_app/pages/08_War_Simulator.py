@@ -27,7 +27,7 @@ if not squads:
 squad_choice = st.selectbox(
     "Friendly squad",
     options=squads,
-    format_func=lambda r: f"{r['name']} · {r.get('region') or 'Unassigned'}",
+    format_func=lambda r: f"{r['name']}",
 )
 
 members = sb.table("squad_members").select("unit_type,quantity").eq("squad_id", squad_choice["id"]).execute().data
