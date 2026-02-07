@@ -3,136 +3,134 @@ import pandas as pd
 
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
-from utils.ledger import get_current_week
-from utils.undo import log_action, get_last_action, pop_last_action
 from utils.dm import dm_gate
-from utils.reputation_rules import derive_dc_bonus
-from utils.navigation import sidebar_nav
+from utils.ledger import get_current_week
 
-UNDO_CATEGORY = "reputation"
+# ✅ IMPORTANT: your DC/BONUS rule in one place
+def dc_bonus_from_score(score: int) -> tuple[int, int]:
+    """
+    Adjust this mapping to match your doc precisely.
+    This one is monotonic and fixes the bug you saw (3 and 7 both giving DC 15).
+    Example: higher reputation => lower DC, higher bonus.
+    """
+    score = int(score)
+    # Clamp expected range (edit if your range differs)
+    score = max(0, min(10, score))
 
-st.set_page_config(page_title="Silver Council | Reputation", page_icon="🗳️", layout="wide")
+    # Example mapping (replace with your canon table if needed):
+    # score: 0..10
+    dc_table = {0:20, 1:19, 2:18, 3:17, 4:16, 5:15, 6:14, 7:13, 8:12, 9:11, 10:10}
+    bonus_table = {0:-3, 1:-2, 2:-1, 3:0, 4:1, 5:2, 6:3, 7:4, 8:5, 9:6, 10:7}
+
+    return dc_table[score], bonus_table[score]
+
+
+st.set_page_config(page_title="Reputation", page_icon="📜", layout="wide")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
-sidebar_nav(sb)
+
 week = get_current_week(sb)
 
-st.title("🗳️ The Silver Council")
-st.caption(f"Reputation · Week {week}")
+st.title("📜 Reputation")
+st.caption(f"Week {week}")
 
-with st.popover("↩️ Undo (Reputation)"):
-    last = get_last_action(sb, category=UNDO_CATEGORY)
-    if not last:
-        st.write("No reputation edits to undo.")
-    else:
-        payload = last["payload"] or {}
-        st.write(f"Last: {last.get('action','')} · {payload.get('name','')}")
-        if st.button("Undo last", key="undo_rep"):
-            rep_id = payload.get("reputation_id")
-            prev_score = payload.get("prev_score")
-            if rep_id is not None and prev_score is not None:
-                sb.table("reputation").update({"score": prev_score}).eq("id", rep_id).execute()
-            pop_last_action(sb, action_id=last["id"])
-            st.success("Undone.")
-            st.rerun()
+# --- DM detection (whatever your app uses) ---
+is_dm = st.session_state.get("is_dm", False)
 
-# Load factions and current reputation rows
-factions = sb.table("factions").select("id,name,type").order("type").order("name").execute().data
-reps = sb.table("reputation").select("id,faction_id,week,score,dc,bonus,note").eq("week", week).execute().data
-rep_by_faction = {r["faction_id"]: r for r in reps}
+# --- Filters ---
+filter_view = st.radio("Show", ["All", "Regions", "Families"], horizontal=True)
 
-st.subheader("Reputation")
-view = st.radio(
-    "Filter",
-    options=["All", "Regions", "Families"],
-    horizontal=True,
-)
-if view == "Regions":
+show_hidden = False
+if is_dm:
+    show_hidden = st.toggle("Show hidden reputations (DM only)", value=False)
+
+# --- Load factions (includes is_hidden) ---
+# NOTE: If your factions table uses different column names, adjust here.
+factions = sb.table("factions").select("id,name,type,is_hidden").order("type").order("name").execute().data or []
+
+# Apply Regions/Families filter
+if filter_view == "Regions":
     factions = [f for f in factions if str(f.get("type")) == "region"]
-elif view == "Families":
-    factions = [f for f in factions if str(f.get("type")) in {"house", "family"}]
+elif filter_view == "Families":
+    factions = [f for f in factions if str(f.get("type")) in {"family", "house"}]
 
-if not factions:
-    st.warning("No factions seeded yet. Seed `factions` table (from Excel or manually).")
+# Apply hidden filter for players (and for DM unless they toggle show_hidden)
+if not show_hidden:
+    factions = [f for f in factions if not bool(f.get("is_hidden", False))]
+
+visible_faction_ids = [f["id"] for f in factions]
+
+# --- Load reputation rows for this week ---
+rep_rows = sb.table("reputation").select("week,faction_id,score,dc,bonus,note").eq("week", week).execute().data or []
+
+rep_map = {r["faction_id"]: r for r in rep_rows}
+
+# --- Build dataframe for UI ---
+data = []
+for f in factions:
+    r = rep_map.get(f["id"], {})
+    score = int(r.get("score") or 0)
+    dc, bonus = dc_bonus_from_score(score)
+
+    # display uses computed DC/bonus (not stale stored values)
+    data.append({
+        "Faction": f.get("name"),
+        "Type": f.get("type"),
+        "Score": score,
+        "DC": dc,
+        "Bonus": bonus,
+        "Notes": r.get("note") or "",
+        "_faction_id": f["id"],
+    })
+
+df = pd.DataFrame(data)
+
+if df.empty:
+    st.info("No reputations to display with current filters.")
     st.stop()
 
-rows = []
-for f in factions:
-    r = rep_by_faction.get(f["id"])
-    score = int(r["score"]) if r else 0
-    derived = derive_dc_bonus(score)
-    rows.append(
-        {
-            "name": f["name"],
-            "type": f["type"],
-            "score": score,
-            "dc": derived.dc,
-            "bonus": derived.bonus,
-            "note": r.get("note") if r else "",
-            "_faction_id": f["id"],
-            "_reputation_id": r["id"] if r else None,
-        }
-    )
-
-df = pd.DataFrame(rows)
-
-st.subheader("Edit reputation scores")
-st.caption(
-    "Reputation scores are DM-controlled. DC and bonus are derived automatically from the score."
-)
-
-# Hide internal IDs from the UI, but keep them for saving.
-display_df = df.drop(columns=["_faction_id", "_reputation_id"])
+st.caption("Score edits require DM password. DC/Bonus auto-update from Score.")
 
 edited = st.data_editor(
-    display_df,
+    df.drop(columns=["_faction_id"]),
     use_container_width=True,
     hide_index=True,
     column_config={
-        "name": st.column_config.TextColumn("Name", disabled=True),
-        "type": st.column_config.TextColumn("Type", disabled=True),
-        "score": st.column_config.NumberColumn("Reputation", step=1),
-        "dc": st.column_config.NumberColumn("DC", disabled=True),
-        "bonus": st.column_config.NumberColumn("Bonus", disabled=True),
-        "note": st.column_config.TextColumn("Note"),
+        "Faction": st.column_config.TextColumn(disabled=True),
+        "Type": st.column_config.TextColumn(disabled=True),
+        "DC": st.column_config.NumberColumn(disabled=True),
+        "Bonus": st.column_config.NumberColumn(disabled=True),
     },
     key="rep_editor",
 )
 
-if st.button("Save changes"):
-    if not dm_gate("DM password required to modify reputation", key="rep_save"):
-        st.stop()
+# --- Save ---
+if dm_gate("DM password required to save reputation changes", key="rep_save_gate"):
+    if st.button("💾 Save changes", type="primary"):
+        try:
+            # map edited rows back to faction ids by index
+            for i, row in edited.iterrows():
+                faction_id = df.iloc[i]["_faction_id"]
+                score = int(row["Score"])
+                note = str(row.get("Notes") or "").strip()
 
-    # Compare with original and upsert
-    for idx, row in edited.iterrows():
-        fid = df.iloc[idx]["_faction_id"]
-        rid = df.iloc[idx]["_reputation_id"]
+                dc, bonus = dc_bonus_from_score(score)
 
-        score = int(row["score"])
-        derived = derive_dc_bonus(score)
-        payload = {
-            "faction_id": fid,
-            "week": week,
-            "score": score,
-            "dc": derived.dc,
-            "bonus": derived.bonus,
-            "note": str(row["note"] or ""),
-        }
-        if rid:
-            # log previous score for undo
-            prev = rep_by_faction.get(fid)
-            prev_score = int(prev["score"]) if prev else 0
-            if prev_score != payload["score"]:
-                log_action(
-                    sb,
-                    category=UNDO_CATEGORY,
-                    action="edit_reputation",
-                    payload={"reputation_id": rid, "prev_score": prev_score, "name": row["name"]},
-                )
-            sb.table("reputation").update(payload).eq("id", rid).execute()
-        else:
-            sb.table("reputation").insert(payload).execute()
+                # ✅ Upsert by (week, faction_id)
+                sb.table("reputation").upsert({
+                    "week": week,
+                    "faction_id": faction_id,
+                    "score": score,
+                    "dc": dc,
+                    "bonus": bonus,
+                    "note": note,
+                }).execute()
 
-    st.success("Saved.")
-    st.rerun()
+            st.success("Saved reputation updates to Supabase.")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Failed to save: {e}")
+else:
+    st.warning("DM locked. Players can view only.")
