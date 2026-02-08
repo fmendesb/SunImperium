@@ -5,19 +5,24 @@ def hide_default_sidebar_nav() -> None:
 
     Streamlit's DOM varies by version, so we target multiple selectors.
     """
+    
     st.markdown(
-        """
-        <style>
-          /* Hide built-in multipage nav (various Streamlit versions) */
-          section[data-testid="stSidebarNav"] { display: none !important; }
-          div[data-testid="stSidebarNav"] { display: none !important; }
-          ul[data-testid="stSidebarNavItems"] { display: none !important; }
-          /* Keep sidebar container visible */
-          section[data-testid="stSidebar"] { display: block; }
-          div[data-testid="stSidebar"] { display: block; }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    """
+    <style>
+      /* Hide Streamlit's built-in multipage navigation list */
+      section[data-testid="stSidebarNav"] { display: none !important; }
+
+      /* Force sidebar container visible (prevents 'disappearing') */
+      section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; }
+
+      /* Ensure the sidebar content area is visible */
+      [data-testid="stSidebarContent"] { display: block !important; visibility: visible !important; }
+
+      /* If Streamlit collapses sidebar, keep it expanded */
+      button[kind="header"] { visibility: visible !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
     )
 
 def page_config(title: str, icon: str = "🌙") -> None:
