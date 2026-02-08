@@ -1,27 +1,13 @@
 import streamlit as st
 import pandas as pd
 
-from utils.nav import page_config, sidebar
+from utils.nav import hide_default_sidebar_nav
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
-from utils.ledger import get_current_week
 from utils.dm import dm_gate
+from utils.ledger import get_current_week
 
-
-def dc_bonus_from_score(score: int) -> tuple[int, int]:
-    """Monotonic mapping: higher reputation -> lower DC, higher bonus.
-
-    Adjust the tables to match your exact canon if needed.
-    """
-    score = int(score)
-    score = max(0, min(10, score))
-    dc_table = {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10}
-    bonus_table = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7}
-    return dc_table[score], bonus_table[score]
-
-
-page_config("Silver Council | Reputation", "📜")
-sidebar("📜 Reputation")
+hide_default_sidebar_nav()
 
 sb = get_supabase()
 ensure_bootstrap(sb)
@@ -30,9 +16,28 @@ week = get_current_week(sb)
 st.title("📜 Reputation")
 st.caption(f"Week {week}")
 
-is_dm = dm_gate("DM password required to edit reputation", key="rep")
+# Identify DM state
+is_dm = bool(st.session_state.get("is_dm", False))
 
-# Load factions (these are the 'possible reputations')
+# Filters
+filter_view = st.radio("Show", ["All", "Regions", "Families"], horizontal=True)
+show_hidden = False
+if is_dm:
+    show_hidden = st.toggle("Show hidden (DM only)", value=False)
+
+
+def dc_bonus_from_score(score: int) -> tuple[int, int]:
+    """Monotonic mapping: higher score => lower DC, higher bonus.
+
+    Replace table if you have a canon mapping in your doc.
+    """
+    s = max(0, min(10, int(score)))
+    dc_table = {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10}
+    bonus_table = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7}
+    return dc_table[s], bonus_table[s]
+
+
+# Load factions (the list of all reputations)
 try:
     factions = (
         sb.table("factions")
@@ -54,20 +59,16 @@ except Exception:
         or []
     )
 
-if not factions:
-    st.warning("No factions found. Seed the `factions` table first.")
-    st.stop()
-
-show_hidden = False
-if is_dm:
-    show_hidden = st.toggle("Show hidden reputations (DM)", value=False)
+if filter_view == "Regions":
+    factions = [f for f in factions if str(f.get("type")) == "region"]
+elif filter_view == "Families":
+    factions = [f for f in factions if str(f.get("type")) in {"family", "house"}]
 
 if not show_hidden:
     factions = [f for f in factions if not bool(f.get("is_hidden", False))]
 
-faction_ids = [f["id"] for f in factions]
-
-reps = (
+# Load current-week reputation rows
+rep_rows = (
     sb.table("reputation")
     .select("week,faction_id,score,dc,bonus,note")
     .eq("week", week)
@@ -75,66 +76,70 @@ reps = (
     .data
     or []
 )
-rep_map = {r["faction_id"]: r for r in reps}
+rep_map = {r["faction_id"]: r for r in rep_rows}
 
-rows = []
+# Build UI dataframe (no IDs shown)
+data = []
 for f in factions:
-    r = rep_map.get(f["id"], {})
+    fid = f["id"]
+    r = rep_map.get(fid, {})
     score = int(r.get("score") or 0)
     dc, bonus = dc_bonus_from_score(score)
-    rows.append(
+    data.append(
         {
-            "Name": f.get("name"),
+            "Faction": f.get("name"),
             "Type": f.get("type"),
             "Score": score,
             "DC": dc,
             "Bonus": bonus,
             "Notes": r.get("note") or "",
-            "_faction_id": f["id"],
+            "_faction_id": fid,
         }
     )
 
-df = pd.DataFrame(rows)
+if not data:
+    st.info("No reputations to display.")
+    st.stop()
 
-st.subheader("Reputation Table")
-st.caption("DC and Bonus are derived from Score and update automatically on save.")
+df = pd.DataFrame(data)
 
 edited = st.data_editor(
     df.drop(columns=["_faction_id"]),
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Name": st.column_config.TextColumn(disabled=True),
+        "Faction": st.column_config.TextColumn(disabled=True),
         "Type": st.column_config.TextColumn(disabled=True),
         "DC": st.column_config.NumberColumn(disabled=True),
         "Bonus": st.column_config.NumberColumn(disabled=True),
-        "Score": st.column_config.NumberColumn(step=1, min_value=0, max_value=10, disabled=not is_dm),
-        "Notes": st.column_config.TextColumn(disabled=not is_dm),
     },
     key="rep_editor",
 )
 
-if st.button("Save", type="primary", disabled=not is_dm):
-    try:
-        for i, row in edited.iterrows():
-            faction_id = df.iloc[i]["_faction_id"]
-            score = int(row["Score"])
-            note = str(row.get("Notes") or "").strip()
-            dc, bonus = dc_bonus_from_score(score)
+if dm_gate("DM password required to save reputation changes", key="rep_save"):
+    if st.button("💾 Save changes", type="primary"):
+        try:
+            for i, row in edited.iterrows():
+                fid = df.iloc[i]["_faction_id"]
+                score = int(row["Score"])
+                note = str(row.get("Notes") or "").strip()
+                dc, bonus = dc_bonus_from_score(score)
 
-            sb.table("reputation").upsert(
-                {
-                    "week": week,
-                    "faction_id": faction_id,
-                    "score": score,
-                    "dc": dc,
-                    "bonus": bonus,
-                    "note": note,
-                },
-                on_conflict="week,faction_id",
-            ).execute()
+                sb.table("reputation").upsert(
+                    {
+                        "week": week,
+                        "faction_id": fid,
+                        "score": score,
+                        "dc": dc,
+                        "bonus": bonus,
+                        "note": note,
+                    },
+                    on_conflict="week,faction_id",
+                ).execute()
 
-        st.success("Saved.")
-        st.rerun()
-    except Exception as e:
-        st.error(f"Failed to save: {e}")
+            st.success("Saved.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to save: {e}")
+else:
+    st.info("View-only (DM locked).")
