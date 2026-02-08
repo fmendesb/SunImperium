@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 import json
+from typing import Any, Dict, Optional
+
 from supabase import Client
 
 
-def log_action(sb: Client, *, category: str, action: str, payload: dict) -> None:
+def log_action(sb: Client, *, category: str, action: str, payload: Dict[str, Any]) -> None:
     sb.table("action_logs").insert(
         {
             "category": category,
@@ -14,7 +14,7 @@ def log_action(sb: Client, *, category: str, action: str, payload: dict) -> None
     ).execute()
 
 
-def get_last_action(sb: Client, *, category: str) -> dict | None:
+def get_last_action(sb: Client, *, category: str) -> Optional[Dict[str, Any]]:
     res = (
         sb.table("action_logs")
         .select("id,action,payload,created_at")
