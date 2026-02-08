@@ -1,96 +1,58 @@
 import streamlit as st
 import pandas as pd
 
-from utils.nav import page_config, sidebar
+from utils.nav import hide_default_sidebar_nav
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
-from utils.undo import log_action, get_last_action, pop_last_action
 from utils.dm import dm_gate
 
-UNDO_CATEGORY = "legislation"
-
-page_config("Silver Council | Legislation", "📜")
-sidebar("📖 Legislation")
+hide_default_sidebar_nav()
 
 sb = get_supabase()
 ensure_bootstrap(sb)
 
-st.title("📜 Legislation")
-st.caption("The Silver Council Codex")
+st.title("📖 Legislation")
+st.caption("Codex of laws. DM can add or edit; players can read.")
 
-with st.popover("↩️ Undo (Legislation)"):
-    last = get_last_action(sb, category=UNDO_CATEGORY)
-    if not last:
-        st.write("No actions to undo.")
-    else:
-        payload = last.get("payload") or {}
-        st.write(f"Last: {last.get('action','')} · {payload.get('title','')}")
-        if st.button("Undo last", key="undo_leg"):
-            if last.get("action") == "add_law" and payload.get("law_id"):
-                sb.table("legislation").delete().eq("id", payload["law_id"]).execute()
-                pop_last_action(sb, action_id=last["id"])
-                st.success("Undone.")
-                st.rerun()
-            else:
-                st.error("Undo not implemented for this action type.")
+# Display existing laws
+try:
+    rows = (
+        sb.table("legislation")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+except Exception:
+    rows = []
 
-rows = (
-    sb.table("legislation")
-    .select("id,created_at,chapter,item,article,title,dc,description,effects,active")
-    .order("chapter")
-    .order("item")
-    .order("article")
-    .execute()
-    .data
-)
-
-df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["chapter", "item", "article", "title", "dc", "active"])
-
-# Players don't need internal ids/timestamps.
-df = df.drop(columns=["id", "created_at"], errors="ignore")
-
-st.subheader("Codex")
-st.dataframe(df, use_container_width=True, hide_index=True)
+if rows:
+    df = pd.DataFrame(rows)
+    # Players don't need internal IDs/timestamps
+    df = df.drop(columns=["id", "created_at", "updated_at"], errors="ignore")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+else:
+    st.info("No legislation yet.")
 
 st.divider()
-st.subheader("Add / Update Law")
-with st.form("law_form", clear_on_submit=False):
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-    with c1:
-        chapter = st.text_input("Chapter", value="")
-    with c2:
-        item = st.text_input("Item", value="")
-    with c3:
-        article = st.text_input("Article", value="")
-    with c4:
-        title = st.text_input("Title", value="")
 
-    dc = st.number_input("DC", min_value=0, max_value=50, value=0, step=1)
-    description = st.text_area("Description", value="")
-    effects = st.text_area("Effects (free text for now)", value="")
-    active = st.checkbox("Active", value=True)
+# DM section
+unlocked = dm_gate("DM password required to edit legislation", key="leg")
 
-    submitted = st.form_submit_button("Save")
-    if submitted:
-        if not dm_gate("DM password required to edit legislation", key="leg_save"):
-            st.stop()
-        ins = (
-            sb.table("legislation")
-            .insert(
-                {
-                    "chapter": chapter,
-                    "item": item,
-                    "article": article,
-                    "title": title,
-                    "dc": int(dc),
-                    "description": description,
-                    "effects": effects,
-                    "active": active,
-                }
-            )
-            .execute()
-        )
-        law_id = ins.data[0]["id"] if ins.data else None
-        log_action(sb, category=UNDO_CATEGORY, action="add_law", payload={"law_id": law_id, "title": title})
-        st.success("Saved.")
-        st.rerun()
+with st.expander("DM: Add a law", expanded=False):
+    title = st.text_input("Title", key="law_title")
+    category = st.text_input("Category", key="law_category")
+    text = st.text_area("Text", height=200, key="law_text")
+
+    if st.button("Save", type="primary", key="law_save"):
+        if not unlocked:
+            st.error("DM password required.")
+        else:
+            payload = {"title": title, "category": category, "text": text}
+            try:
+                sb.table("legislation").insert(payload).execute()
+                st.success("Law added.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not save law: {e}")
