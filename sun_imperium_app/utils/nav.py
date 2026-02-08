@@ -1,61 +1,46 @@
 import streamlit as st
 
+
 def hide_default_sidebar_nav() -> None:
-    """Hide Streamlit's built-in multipage navigation (file-based Pages list).
-
-    Streamlit's DOM varies by version, so we target multiple selectors.
-    """
-    
+    """Hide Streamlit's built-in Pages navigation list (top list in sidebar)."""
     st.markdown(
-    """
-    <style>
-      /* Hide Streamlit's built-in multipage navigation list */
-      section[data-testid="stSidebarNav"] { display: none !important; }
+        """
+        <style>
+          /* Hide built-in multipage nav (Streamlit versions vary in DOM) */
+          section[data-testid='stSidebarNav'],
+          div[data-testid='stSidebarNav'],
+          nav[aria-label='App pages'],
+          div[aria-label='App pages'] {
+            display: none !important;
+            height: 0 !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+          }
 
-      /* Force sidebar container visible (prevents 'disappearing') */
-      section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; }
-
-      /* Ensure the sidebar content area is visible */
-      [data-testid="stSidebarContent"] { display: block !important; visibility: visible !important; }
-
-      /* If Streamlit collapses sidebar, keep it expanded */
-      button[kind="header"] { visibility: visible !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+          /* Keep sidebar visible */
+          section[data-testid='stSidebar'],
+          [data-testid='stSidebarContent'] {
+            display: block !important;
+            visibility: visible !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
+
 def page_config(title: str, icon: str = "🌙") -> None:
-    """Backwards-compatible helper.
+    """Lightweight page header helper (does NOT call st.set_page_config)."""
+    st.markdown(f"# {icon} {title}")
 
-    IMPORTANT: Do not call st.set_page_config here (must be first Streamlit command).
-    Also: do not render a page title here to avoid duplicate headers.
-    Pages should render their own titles.
-    """
-    # Intentionally a no-op besides an optional tiny caption.
-    st.caption(f"{icon} {title}")
-
-def _load_hidden_pages() -> set[str]:
-    """Best-effort load of ui_hidden_pages from app_state."""
-    try:
-        from utils.supabase_client import get_supabase  # local import to avoid hard dependency at module import
-        sb = get_supabase()
-        row = sb.table("app_state").select("id,ui_hidden_pages").eq("id", 1).limit(1).execute().data or []
-        if row and isinstance(row[0].get("ui_hidden_pages"), list):
-            return set(row[0].get("ui_hidden_pages") or [])
-    except Exception:
-        pass
-    return set()
 
 def sidebar(active: str | None = None) -> None:
-    """Render the custom emoji navigation and hide the default nav."""
+    """Render custom emoji nav and hide Streamlit's default nav."""
     hide_default_sidebar_nav()
 
     st.sidebar.markdown("## 🌙 Sun Imperium")
     st.sidebar.caption("Navigation")
-
-    is_dm = bool(st.session_state.get("is_dm", False))
-    hidden_pages = _load_hidden_pages() if not is_dm else set()
 
     pages = [
         ("🏛 Dashboard", "pages/01_Silver_Council_Dashboard.py"),
@@ -71,8 +56,5 @@ def sidebar(active: str | None = None) -> None:
     ]
 
     for label, target in pages:
-        fname = target.split("/")[-1]
-        if (not is_dm) and (fname in hidden_pages):
-            continue
         prefix = "➡️ " if (active and label == active) else ""
         st.sidebar.page_link(target, label=f"{prefix}{label}")
