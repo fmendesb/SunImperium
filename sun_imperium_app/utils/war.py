@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 
@@ -26,36 +24,6 @@ class Force:
     clerics: int
     others: int  # everything neutral
 
-    @classmethod
-    def from_rows(cls, rows: list[dict]) -> "Force":
-        """Build a Force from squad_members-like rows.
-
-        Expected keys per row: unit_type, quantity
-        """
-        buckets = {"guardian": 0, "archer": 0, "mage": 0, "cleric": 0, "others": 0}
-        for r in rows or []:
-            t = str(r.get("unit_type") or "others").lower()
-            q = int(r.get("quantity") or 0)
-            if t not in buckets:
-                t = "others"
-            buckets[t] += max(0, q)
-        return cls(
-            guardians=buckets["guardian"],
-            archers=buckets["archer"],
-            mages=buckets["mage"],
-            clerics=buckets["cleric"],
-            others=buckets["others"],
-        )
-
-    def as_dict(self) -> dict:
-        return {
-            "guardians": int(self.guardians),
-            "archers": int(self.archers),
-            "mages": int(self.mages),
-            "clerics": int(self.clerics),
-            "others": int(self.others),
-        }
-
 
 @dataclass
 class BattleResult:
@@ -68,12 +36,10 @@ class BattleResult:
     enemy_power: float
 
 
-def compute_power(
-    force: Force,
-    *,
-    vs: Force | None = None,
-    weights: dict[str, float] | None = None,
-) -> float:
+from typing import Optional
+
+
+def compute_power(force: Force, *, vs: Optional[Force] = None) -> float:
     """Compute effective power.
 
     Base weights:
@@ -90,13 +56,6 @@ def compute_power(
         "others": 2.0,
         "cleric": 1.0,
     }
-
-    # Allow callers to override base weights (e.g., to reflect unit power tiers
-    # and infrastructure power boosts).
-    if weights:
-        for k, v in weights.items():
-            if k in base:
-                base[k] = float(v)
 
     buff = min(0.30, 0.05 * max(0, force.clerics))
 
@@ -177,13 +136,7 @@ def apply_casualties(force: Force, casualty_rate: float) -> tuple[Force, Force]:
     return rem, lost
 
 
-def simulate_battle(
-    ally: Force,
-    enemy: Force,
-    *,
-    ally_weights: dict[str, float] | None = None,
-    enemy_weights: dict[str, float] | None = None,
-) -> BattleResult:
+def simulate_battle(ally: Force, enemy: Force) -> BattleResult:
     """Deterministic battle sim.
 
     - Winner determined by effective power.
@@ -192,8 +145,8 @@ def simulate_battle(
       * Loser casualty: 35%..95%
     - Never 0 survivors.
     """
-    ally_p = compute_power(ally, vs=enemy, weights=ally_weights)
-    enemy_p = compute_power(enemy, vs=ally, weights=enemy_weights)
+    ally_p = compute_power(ally, vs=enemy)
+    enemy_p = compute_power(enemy, vs=ally)
 
     # Avoid division blowups
     ratio = (ally_p + 1e-6) / (enemy_p + 1e-6)
