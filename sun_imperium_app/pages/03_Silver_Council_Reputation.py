@@ -1,113 +1,140 @@
 import streamlit as st
 import pandas as pd
 
+from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week
-from utils.undo import log_action, get_last_action, pop_last_action
+from utils.dm import dm_gate
 
 
-def render():
-    UNDO_CATEGORY = "reputation"
+def dc_bonus_from_score(score: int) -> tuple[int, int]:
+    """Monotonic mapping: higher reputation -> lower DC, higher bonus.
+
+    Adjust the tables to match your exact canon if needed.
+    """
+    score = int(score)
+    score = max(0, min(10, score))
+    dc_table = {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10}
+    bonus_table = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7}
+    return dc_table[score], bonus_table[score]
 
 
-    sb = get_supabase()
-    ensure_bootstrap(sb)
-    week = get_current_week(sb)
+page_config("Silver Council | Reputation", "📜")
+sidebar("📜 Reputation")
 
-    st.title("🗳️ The Silver Council")
-    st.caption(f"Reputation · Week {week}")
+sb = get_supabase()
+ensure_bootstrap(sb)
+week = get_current_week(sb)
 
-    with st.popover("↩️ Undo (Reputation)"):
-        last = get_last_action(sb, category=UNDO_CATEGORY)
-        if not last:
-            st.write("No reputation edits to undo.")
-        else:
-            payload = last["payload"] or {}
-            st.write(f"Last: {last.get('action','')} · {payload.get('name','')}")
-            if st.button("Undo last", key="undo_rep"):
-                rep_id = payload.get("reputation_id")
-                prev_score = payload.get("prev_score")
-                if rep_id is not None and prev_score is not None:
-                    sb.table("reputation").update({"score": prev_score}).eq("id", rep_id).execute()
-                pop_last_action(sb, action_id=last["id"])
-                st.success("Undone.")
-                st.rerun()
+st.title("📜 Reputation")
+st.caption(f"Week {week}")
 
-    # Load factions and current reputation rows
-    factions = sb.table("factions").select("id,name,type").order("type").order("name").execute().data
-    reps = sb.table("reputation").select("id,faction_id,week,score,dc,bonus,note").eq("week", week).execute().data
-    rep_by_faction = {r["faction_id"]: r for r in reps}
+is_dm = dm_gate("DM password required to edit reputation", key="rep")
 
-    if not factions:
-        st.warning("No factions seeded yet. Seed `factions` table (from Excel or manually).")
-        st.stop()
-
-    rows = []
-    for f in factions:
-        r = rep_by_faction.get(f["id"])
-        rows.append(
-            {
-                "faction_id": f["id"],
-                "name": f["name"],
-                "type": f["type"],
-                "score": int(r["score"]) if r else 0,
-                "dc": int(r["dc"]) if r and r.get("dc") is not None else None,
-                "bonus": int(r["bonus"]) if r and r.get("bonus") is not None else None,
-                "note": r.get("note") if r else "",
-                "reputation_id": r["id"] if r else None,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    st.subheader("Edit reputation scores")
-    st.caption("Edit the score. Status thresholds/labels are derived elsewhere.")
-
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "faction_id": st.column_config.TextColumn("faction_id", disabled=True, width="small"),
-            "reputation_id": st.column_config.TextColumn("reputation_id", disabled=True, width="small"),
-            "name": st.column_config.TextColumn("Name", disabled=True),
-            "type": st.column_config.TextColumn("Type", disabled=True),
-            "score": st.column_config.NumberColumn("Reputation", step=1),
-            "dc": st.column_config.NumberColumn("DC", step=1),
-            "bonus": st.column_config.NumberColumn("Bonus", step=1),
-            "note": st.column_config.TextColumn("Note"),
-        },
-        key="rep_editor",
+# Load factions (these are the 'possible reputations')
+try:
+    factions = (
+        sb.table("factions")
+        .select("id,name,type,is_hidden")
+        .order("type")
+        .order("name")
+        .execute()
+        .data
+        or []
+    )
+except Exception:
+    factions = (
+        sb.table("factions")
+        .select("id,name,type")
+        .order("type")
+        .order("name")
+        .execute()
+        .data
+        or []
     )
 
-    if st.button("Save changes"):
-        # Compare with original and upsert
-        for _, row in edited.iterrows():
-            fid = row["faction_id"]
-            rid = row["reputation_id"]
-            payload = {
-                "faction_id": fid,
-                "week": week,
-                "score": int(row["score"]),
-                "dc": int(row["dc"]) if pd.notna(row["dc"]) else None,
-                "bonus": int(row["bonus"]) if pd.notna(row["bonus"]) else None,
-                "note": str(row["note"] or ""),
-            }
-            if rid:
-                # log previous score for undo
-                prev = rep_by_faction.get(fid)
-                prev_score = int(prev["score"]) if prev else 0
-                if prev_score != payload["score"]:
-                    log_action(
-                        sb,
-                        category=UNDO_CATEGORY,
-                        action="edit_reputation",
-                        payload={"reputation_id": rid, "prev_score": prev_score, "name": row["name"]},
-                    )
-                sb.table("reputation").update(payload).eq("id", rid).execute()
-            else:
-                sb.table("reputation").insert(payload).execute()
+if not factions:
+    st.warning("No factions found. Seed the `factions` table first.")
+    st.stop()
+
+show_hidden = False
+if is_dm:
+    show_hidden = st.toggle("Show hidden reputations (DM)", value=False)
+
+if not show_hidden:
+    factions = [f for f in factions if not bool(f.get("is_hidden", False))]
+
+faction_ids = [f["id"] for f in factions]
+
+reps = (
+    sb.table("reputation")
+    .select("week,faction_id,score,dc,bonus,note")
+    .eq("week", week)
+    .execute()
+    .data
+    or []
+)
+rep_map = {r["faction_id"]: r for r in reps}
+
+rows = []
+for f in factions:
+    r = rep_map.get(f["id"], {})
+    score = int(r.get("score") or 0)
+    dc, bonus = dc_bonus_from_score(score)
+    rows.append(
+        {
+            "Name": f.get("name"),
+            "Type": f.get("type"),
+            "Score": score,
+            "DC": dc,
+            "Bonus": bonus,
+            "Notes": r.get("note") or "",
+            "_faction_id": f["id"],
+        }
+    )
+
+df = pd.DataFrame(rows)
+
+st.subheader("Reputation Table")
+st.caption("DC and Bonus are derived from Score and update automatically on save.")
+
+edited = st.data_editor(
+    df.drop(columns=["_faction_id"]),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Name": st.column_config.TextColumn(disabled=True),
+        "Type": st.column_config.TextColumn(disabled=True),
+        "DC": st.column_config.NumberColumn(disabled=True),
+        "Bonus": st.column_config.NumberColumn(disabled=True),
+        "Score": st.column_config.NumberColumn(step=1, min_value=0, max_value=10, disabled=not is_dm),
+        "Notes": st.column_config.TextColumn(disabled=not is_dm),
+    },
+    key="rep_editor",
+)
+
+if st.button("Save", type="primary", disabled=not is_dm):
+    try:
+        for i, row in edited.iterrows():
+            faction_id = df.iloc[i]["_faction_id"]
+            score = int(row["Score"])
+            note = str(row.get("Notes") or "").strip()
+            dc, bonus = dc_bonus_from_score(score)
+
+            sb.table("reputation").upsert(
+                {
+                    "week": week,
+                    "faction_id": faction_id,
+                    "score": score,
+                    "dc": dc,
+                    "bonus": bonus,
+                    "note": note,
+                },
+                on_conflict="week,faction_id",
+            ).execute()
 
         st.success("Saved.")
         st.rerun()
+    except Exception as e:
+        st.error(f"Failed to save: {e}")
