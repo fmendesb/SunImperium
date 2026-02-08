@@ -1,29 +1,46 @@
 import streamlit as st
 
 def hide_default_sidebar_nav() -> None:
-    """Hide Streamlit's built-in multipage navigation (the file-based Pages list)."""
+    """Hide Streamlit's built-in multipage navigation (file-based Pages list).
+
+    Streamlit's DOM varies by version, so we target multiple selectors.
+    """
     st.markdown(
         """
         <style>
-          /* Hide Streamlit's built-in multipage navigation */
+          /* Hide built-in multipage nav (various Streamlit versions) */
           section[data-testid="stSidebarNav"] { display: none !important; }
-          /* Keep the sidebar itself visible */
+          div[data-testid="stSidebarNav"] { display: none !important; }
+          ul[data-testid="stSidebarNavItems"] { display: none !important; }
+          /* Keep sidebar container visible */
           section[data-testid="stSidebar"] { display: block; }
+          div[data-testid="stSidebar"] { display: block; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 def page_config(title: str, icon: str = "🌙") -> None:
-    """
-    Backwards-compatible helper.
+    """Backwards-compatible helper.
 
-    IMPORTANT:
-    - Do NOT call st.set_page_config() here. Streamlit requires it to be the first command
-      in a script, and calling it from imported helpers causes intermittent crashes.
-    - Pages can call this to standardize headings.
+    IMPORTANT: Do not call st.set_page_config here (must be first Streamlit command).
+    Also: do not render a page title here to avoid duplicate headers.
+    Pages should render their own titles.
     """
-    st.title(f"{icon} {title}")
+    # Intentionally a no-op besides an optional tiny caption.
+    st.caption(f"{icon} {title}")
+
+def _load_hidden_pages() -> set[str]:
+    """Best-effort load of ui_hidden_pages from app_state."""
+    try:
+        from utils.supabase_client import get_supabase  # local import to avoid hard dependency at module import
+        sb = get_supabase()
+        row = sb.table("app_state").select("id,ui_hidden_pages").eq("id", 1).limit(1).execute().data or []
+        if row and isinstance(row[0].get("ui_hidden_pages"), list):
+            return set(row[0].get("ui_hidden_pages") or [])
+    except Exception:
+        pass
+    return set()
 
 def sidebar(active: str | None = None) -> None:
     """Render the custom emoji navigation and hide the default nav."""
@@ -31,6 +48,9 @@ def sidebar(active: str | None = None) -> None:
 
     st.sidebar.markdown("## 🌙 Sun Imperium")
     st.sidebar.caption("Navigation")
+
+    is_dm = bool(st.session_state.get("is_dm", False))
+    hidden_pages = _load_hidden_pages() if not is_dm else set()
 
     pages = [
         ("🏛 Dashboard", "pages/01_Silver_Council_Dashboard.py"),
@@ -46,5 +66,8 @@ def sidebar(active: str | None = None) -> None:
     ]
 
     for label, target in pages:
+        fname = target.split("/")[-1]
+        if (not is_dm) and (fname in hidden_pages):
+            continue
         prefix = "➡️ " if (active and label == active) else ""
         st.sidebar.page_link(target, label=f"{prefix}{label}")
