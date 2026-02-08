@@ -6,8 +6,8 @@ from utils.ledger import get_current_week, compute_totals
 
 
 st.set_page_config(
-    page_title="Sun Imperium | Silver Council Dashboard"| Silver Council Dashboard",
-    page_icon="🏛️",
+    page_title="Sun Imperium | Silver Council Dashboard",
+    page_icon="🌙",
     layout="wide",
 )
 
