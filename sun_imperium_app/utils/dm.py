@@ -1,29 +1,27 @@
 import streamlit as st
 
 
-def dm_gate(label: str = "DM action", key: str = "dm_gate") -> bool:
-    """Shared password gate for DM-only actions.
+def dm_gate(prompt: str, key: str = "dm", password: str | None = None) -> bool:
+    """Password gate that is safe to call inside or outside st.form().
 
-    - Safe to call inside or outside st.form() (no st.button() usage).
-    - Persists unlock state in st.session_state for this key.
+    - No st.button() usage (Streamlit disallows buttons inside forms).
+    - Unlock persists in session_state for the given key.
     """
-    dm_password = st.secrets.get("DM_PASSWORD", "") or st.session_state.get("DM_PASSWORD", "")
 
-    # If no password configured, default to allow (dev-friendly).
-    if not dm_password:
+    expected = password or st.secrets.get("DM_PASSWORD") or st.session_state.get("DM_PASSWORD")
+    if not expected:
+        st.warning("DM password not configured (DM_PASSWORD).")
+        return False
+
+    unlocked_key = f"dm_unlocked_{key}"
+    if st.session_state.get(unlocked_key):
         return True
 
-    ok_key = f"{key}_ok"
-    if st.session_state.get(ok_key, False):
-        st.success("DM unlocked.")
-        return True
-
-    st.info(f"🔒 {label}")
-    entered = st.text_input("DM password", type="password", key=f"{key}_pwd")
-
-    if entered and entered == dm_password:
-        st.session_state[ok_key] = True
-        st.success("Unlocked for this session.")
+    st.info(prompt)
+    entered = st.text_input("DM Password", type="password", key=f"{key}_pwd")
+    if entered and entered == expected:
+        st.session_state[unlocked_key] = True
+        st.success("Unlocked.")
         return True
 
     return False
