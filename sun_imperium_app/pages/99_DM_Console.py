@@ -7,8 +7,16 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
+from utils.nav import hide_default_sidebar_nav
 
-st.set_page_config(page_title="DM Console", page_icon="🔮", layout="wide")
+# 🔒 hide Streamlit's native page navigation
+hide_default_sidebar_nav()
+
+st.set_page_config(
+    page_title="DM Console",
+    page_icon="🔮",
+    layout="wide",
+)
 
 sb = get_supabase()
 ensure_bootstrap(sb)
@@ -17,7 +25,6 @@ week = get_current_week(sb)
 
 st.title("🔮 DM Console")
 st.caption(f"Controls · Current week: {week}")
-
 st.divider()
 
 # -------------------------
