@@ -1,294 +1,85 @@
-from __future__ import annotations
+import streamlit as st
+import pandas as pd
 
-import hashlib
-import random
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from utils.supabase_client import get_supabase
+from utils.state import ensure_bootstrap
+from utils.undo import log_action, get_last_action, pop_last_action
+from utils.dm import dm_gate
 
+UNDO_CATEGORY = "legislation"
 
-# --- Canonical Week-1 constants (from DM) ---
-GRAIN_PER_CAPITA = 0.006  # 2700 / 450_000
-WATER_PER_CAPITA = 0.004  # 1800 / 450_000
+st.set_page_config(page_title="Silver Council | Legislation", page_icon="📜", layout="wide")
 
+sb = get_supabase()
+ensure_bootstrap(sb)
 
-@dataclass
-class WeekEconomyResult:
-    week: int
-    population: int
-    grain_needed: float
-    water_needed: float
-    grain_produced: int
-    water_produced: int
-    survival_ratio: float
-    gross_value: float
-    tax_rate: float
-    tax_income: float
-    player_share: float
-    player_payout: float
-    upkeep_total: float
+st.title("📜 Legislation")
+st.caption("The Silver Council Codex")
 
+with st.popover("↩️ Undo (Legislation)"):
+    last = get_last_action(sb, category=UNDO_CATEGORY)
+    if not last:
+        st.write("No actions to undo.")
+    else:
+        payload = last.get("payload") or {}
+        st.write(f"Last: {last.get('action','')} · {payload.get('title','')}")
+        if st.button("Undo last", key="undo_leg"):
+            if last.get("action") == "add_law" and payload.get("law_id"):
+                sb.table("legislation").delete().eq("id", payload["law_id"]).execute()
+                pop_last_action(sb, action_id=last["id"])
+                st.success("Undone.")
+                st.rerun()
+            else:
+                st.error("Undo not implemented for this action type.")
 
-def get_settings(sb) -> Dict[str, float]:
-    """Read economy settings. Must exist via SQL seed."""
-    r = sb.table("economy_settings").select("tax_rate,player_share,economy_scale,rand_min,rand_max").limit(1).execute()
-    if not r.data:
-        # Safe fallback: conservative by default to avoid runaway payouts.
-        return {
-            "tax_rate": 0.10,
-            "player_share": 0.20,
-            "economy_scale": 0.0001,
-            "rand_min": 0.90,
-            "rand_max": 1.10,
-        }
-    row = r.data[0]
-    return {
-        "tax_rate": float(row.get("tax_rate") or 0.10),
-        "player_share": float(row.get("player_share") or 0.20),
-        "economy_scale": float(row.get("economy_scale") or 1.0),
-        "rand_min": float(row.get("rand_min") or 0.90),
-        "rand_max": float(row.get("rand_max") or 1.10),
-    }
+rows = sb.table("legislation").select("id,chapter,item,article,title,dc,description,effects,active").order("chapter").order("item").order("article").execute().data
 
+df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["chapter","item","article","title","dc","active"])
 
-def rarity_rates(sb) -> Dict[str, float]:
-    r = sb.table("rarity_prod_rates").select("rarity,prod_rate").execute()
-    rates: Dict[str, float] = {}
-    for row in (r.data or []):
-        rates[(row.get("rarity") or "").strip()] = float(row.get("prod_rate") or 0)
-    return rates
+st.subheader("Codex")
+df = df.drop(columns=['id'], errors='ignore')
 
+st.dataframe(df, use_container_width=True, hide_index=True)
 
-def get_population(sb, week: int) -> int:
-    r = sb.table("population_state").select("population").eq("week", week).limit(1).execute()
-    if r.data:
-        return int(r.data[0]["population"])
-    # fallback to week1 default if missing
-    return 450_000
+st.divider()
+st.subheader("Add / Update Law")
+with st.form("law_form", clear_on_submit=False):
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+    with c1:
+        chapter = st.text_input("Chapter", value="")
+    with c2:
+        item = st.text_input("Item", value="")
+    with c3:
+        article = st.text_input("Article", value="")
+    with c4:
+        title = st.text_input("Title", value="")
 
+    dc = st.number_input("DC", min_value=0, max_value=50, value=0, step=1)
+    description = st.text_area("Description", value="")
+    effects = st.text_area("Effects (free text for now)", value="")
+    active = st.checkbox("Active", value=True)
 
-def set_population_row(
-    sb,
-    *,
-    week: int,
-    population: int,
-    grain_needed: float,
-    water_needed: float,
-    grain_produced: int,
-    water_produced: int,
-    survival_ratio: float,
-    growth: int,
-    deaths_starvation: int,
-    deaths_war: int,
-    note: str = "",
-):
-    sb.table("population_state").upsert(
-        {
-            "week": week,
-            "population": int(population),
-            "grain_needed": float(grain_needed),
-            "water_needed": float(water_needed),
-            "grain_produced": int(grain_produced),
-            "water_produced": int(water_produced),
-            "survival_ratio": float(survival_ratio),
-            "growth": int(growth),
-            "deaths_starvation": int(deaths_starvation),
-            "deaths_war": int(deaths_war),
-            "note": note,
-        }
-    ).execute()
-
-
-def _stable_rand(week: int, key: str, a: float, b: float) -> float:
-    # Stable RNG per week+key (so refreshes don't change values)
-    h = hashlib.sha256(f"{week}:{key}".encode("utf-8")).hexdigest()
-    seed = int(h[:8], 16)
-    rng = random.Random(seed)
-    return rng.uniform(a, b)
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def region_multiplier(sb, week: int, region: str) -> float:
-    r = sb.table("region_week_state").select("production_score,dm_modifier").eq("week", week).eq("region", region).limit(1).execute()
-    if not r.data:
-        return 1.0
-    row = r.data[0]
-    ps = float(row.get("production_score") or 0)
-    dm = float(row.get("dm_modifier") or 0)
-    # Simple MVP formula: each score point = +5%
-    mult = 1.0 + (ps * 0.05) + dm
-    return _clamp(mult, 0.50, 1.75)
-
-
-def family_multiplier(sb, week: int, family: str) -> float:
-    # Some installations may not have family_week_state yet.
-    # Treat as neutral multiplier rather than breaking the app.
-    try:
-        r = (
-            sb.table("family_week_state")
-            .select("reputation_score,dm_modifier")
-            .eq("week", week)
-            .eq("family", family)
-            .limit(1)
+    submitted = st.form_submit_button("Save")
+    if submitted:
+        if not dm_gate("DM password required to edit legislation", key="leg_save"):
+            st.stop()
+        ins = (
+            sb.table("legislation")
+            .insert(
+                {
+                    "chapter": chapter,
+                    "item": item,
+                    "article": article,
+                    "title": title,
+                    "dc": int(dc),
+                    "description": description,
+                    "effects": effects,
+                    "active": active,
+                }
+            )
             .execute()
         )
-    except Exception:
-        return 1.0
-    if not r.data:
-        return 1.0
-    row = r.data[0]
-    rep = float(row.get("reputation_score") or 0)
-    dm = float(row.get("dm_modifier") or 0)
-    # Simple MVP formula: each rep point = +3%
-    mult = 1.0 + (rep * 0.03) + dm
-    return _clamp(mult, 0.50, 1.75)
-
-
-def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[str, Any]]]:
-    """Compute weekly production, values, taxes.
-
-    Returns (summary, per_item_rows)
-    """
-    settings = get_settings(sb)
-    rates = rarity_rates(sb)
-
-    pop = get_population(sb, week)
-    grain_needed = pop * GRAIN_PER_CAPITA
-    water_needed = pop * WATER_PER_CAPITA
-
-    rand_min, rand_max = settings["rand_min"], settings["rand_max"]
-    scale = settings["economy_scale"]
-
-    # NOTE: Some datasets may not have reliable rarity filled out.
-    # We also fetch tier and derive rarity when missing.
-    items = (
-        sb.table("gathering_items")
-        .select("name,rarity,tier,base_price_gp,region,family")
-        .execute()
-        .data
-        or []
-    )
-
-    per_item: List[Dict[str, Any]] = []
-    gross_value = 0.0
-    grain_produced = 0
-    water_produced = 0
-
-    for it in items:
-        name = it["name"]
-        rarity = (it.get("rarity") or "").strip()
-        tier = int(it.get("tier") or 1)
-
-        if not rarity:
-            # Heuristic mapping: higher tiers tend to be rarer.
-            # This prevents all items defaulting to the same production rate.
-            if tier <= 1:
-                rarity = "Common"
-            elif tier == 2:
-                rarity = "Uncommon"
-            elif tier in (3, 4):
-                rarity = "Rare"
-            elif tier in (5, 6):
-                rarity = "Very Rare"
-            else:
-                rarity = "Legendary"
-        base_price = float(it.get("base_price_gp") or 0)
-        region = (it.get("region") or "").strip()
-        family = (it.get("family") or "").strip()
-
-        # Determine baseline production rate
-        if name.lower() in {"moonwell water", "moonwell water (t1)", "water"}:
-            prod_rate = WATER_PER_CAPITA
-        elif name.lower() in {"lunar grain", "lunar grain (t1)", "grain"}:
-            prod_rate = GRAIN_PER_CAPITA
-        else:
-            # Fallback is deliberately conservative.
-            prod_rate = float(rates.get(rarity, 0.00002))
-
-        rm = region_multiplier(sb, week, region) if region else 1.0
-        fm = family_multiplier(sb, week, family) if family else 1.0
-        rf = _stable_rand(week, name, rand_min, rand_max)
-
-        qty = int(round(pop * prod_rate * scale * rm * fm * rf))
-        if qty < 0:
-            qty = 0
-
-        effective_price = base_price * rm * fm
-        value = qty * effective_price
-
-        gross_value += value
-        if name.lower().startswith("moonwell water") or name.lower() == "water":
-            water_produced += qty
-        if name.lower().startswith("lunar grain") or name.lower() == "grain":
-            grain_produced += qty
-
-        per_item.append(
-            {
-                "week": week,
-                "item_name": name,
-                "qty": qty,
-                "effective_price": float(effective_price),
-                "gross_value": float(value),
-                "rarity": rarity,
-                "region": region,
-                "family": family,
-            }
-        )
-
-    # Survival ratio
-    grain_ratio = (grain_produced / grain_needed) if grain_needed else 1.0
-    water_ratio = (water_produced / water_needed) if water_needed else 1.0
-    survival_ratio = min(grain_ratio, water_ratio)
-
-    tax_rate = settings["tax_rate"]
-    tax_income = gross_value * tax_rate
-    player_share = settings["player_share"]
-    player_payout = tax_income * player_share
-
-    # Upkeep is computed elsewhere; placeholder here
-    summary = WeekEconomyResult(
-        week=week,
-        population=int(pop),
-        grain_needed=float(grain_needed),
-        water_needed=float(water_needed),
-        grain_produced=int(grain_produced),
-        water_produced=int(water_produced),
-        survival_ratio=float(survival_ratio),
-        gross_value=float(gross_value),
-        tax_rate=float(tax_rate),
-        tax_income=float(tax_income),
-        player_share=float(player_share),
-        player_payout=float(player_payout),
-        upkeep_total=0.0,
-    )
-    return summary, per_item
-
-
-def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[str, Any]]):
-    # Write per-item output (replace for that week)
-    sb.table("economy_week_output").delete().eq("week", summary.week).execute()
-    if per_item_rows:
-        # chunk inserts to avoid payload limits
-        chunk = 250
-        for i in range(0, len(per_item_rows), chunk):
-            sb.table("economy_week_output").insert(per_item_rows[i : i + chunk]).execute()
-
-    # Write summary
-    sb.table("economy_week_summary").upsert(
-        {
-            "week": summary.week,
-            "population": summary.population,
-            "grain_needed": summary.grain_needed,
-            "water_needed": summary.water_needed,
-            "grain_produced": summary.grain_produced,
-            "water_produced": summary.water_produced,
-            "survival_ratio": summary.survival_ratio,
-            "gross_value": summary.gross_value,
-            "tax_rate": summary.tax_rate,
-            "tax_income": summary.tax_income,
-            "player_share": summary.player_share,
-            "player_payout": summary.player_payout,
-        }
-    ).execute()
+        law_id = ins.data[0]["id"] if ins.data else None
+        log_action(sb, category=UNDO_CATEGORY, action="add_law", payload={"law_id": law_id, "title": title})
+        st.success("Saved.")
+        st.rerun()
