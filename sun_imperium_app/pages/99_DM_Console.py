@@ -2,14 +2,14 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 
-from utils.nav import hide_default_sidebar_nav
+from utils.nav import sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
 
-hide_default_sidebar_nav()
+sidebar("🧿 DM Console")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
@@ -152,22 +152,31 @@ else:
         summary, per_item = economy.compute_week_economy(sb, week)
         economy.write_week_economy(sb, summary, per_item)
 
+        if float(summary.gross_value or 0) <= 0:
+            st.warning(
+                "Economy computed but gross value is 0. This usually means `gathering_items` is empty or not seeded. "
+                "You can still use Manual income adjustment as a temporary workaround."
+            )
+
         payout = float(summary.player_payout) + float(manual_income or 0)
         if payout:
-            add_ledger_entry(
-                sb,
-                week=week,
-                direction="in",
-                amount=payout,
-                category="player_payout",
-                note="Player share of taxes",
-                metadata={
-                    "gross_value": summary.gross_value,
-                    "tax_income": summary.tax_income,
-                    "player_payout": summary.player_payout,
-                    "manual_adjustment": float(manual_income or 0),
-                },
-            )
+            try:
+                add_ledger_entry(
+                    sb,
+                    week=week,
+                    direction="in",
+                    amount=payout,
+                    category="player_payout",
+                    note="Player share of taxes",
+                    metadata={
+                        "gross_value": summary.gross_value,
+                        "tax_income": summary.tax_income,
+                        "player_payout": summary.player_payout,
+                        "manual_adjustment": float(manual_income or 0),
+                    },
+                )
+            except Exception as e:
+                st.error(f"Could not add ledger entry (check Supabase RLS / schema): {e}")
 
         # Close current week
         try:
