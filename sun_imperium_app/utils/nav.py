@@ -1,43 +1,31 @@
 import streamlit as st
 
-
-def hide_default_sidebar_nav() -> None:
-    """Hide Streamlit's built-in Pages navigation list (top list in sidebar)."""
+def hide_streamlit_pages_nav_only() -> None:
+    """
+    Hide Streamlit's built-in multipage nav (the 'app / Silver Council…' list)
+    WITHOUT hiding the sidebar itself.
+    """
     st.markdown(
         """
         <style>
-          /* Hide built-in multipage nav (Streamlit versions vary in DOM) */
-          section[data-testid='stSidebarNav'],
-          div[data-testid='stSidebarNav'],
-          nav[aria-label='App pages'],
-          div[aria-label='App pages'] {
-            display: none !important;
-            height: 0 !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            overflow: hidden !important;
-          }
+          /* Hide Streamlit multipage navigation list (different versions use different containers) */
+          section[data-testid="stSidebarNav"] { display: none !important; }
+          nav[aria-label="App pages"] { display: none !important; }
+          div[data-testid="stSidebarNav"] { display: none !important; }
 
-          /* Keep sidebar visible */
-          section[data-testid='stSidebar'],
-          [data-testid='stSidebarContent'] {
-            display: block !important;
-            visibility: visible !important;
-          }
+          /* Force the sidebar container + content to remain visible */
+          section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; width: var(--sidebar-width) !important; }
+          [data-testid="stSidebarContent"] { display: block !important; visibility: visible !important; }
+
+          /* Make sure the collapse button still exists */
+          button[data-testid="collapsedControl"] { display: block !important; visibility: visible !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-
-def page_config(title: str, icon: str = "🌙") -> None:
-    """Lightweight page header helper (does NOT call st.set_page_config)."""
-    st.markdown(f"# {icon} {title}")
-
-
 def sidebar(active: str | None = None) -> None:
-    """Render custom emoji nav and hide Streamlit's default nav."""
-    hide_default_sidebar_nav()
+    hide_streamlit_pages_nav_only()
 
     st.sidebar.markdown("## 🌙 Sun Imperium")
     st.sidebar.caption("Navigation")
@@ -54,6 +42,11 @@ def sidebar(active: str | None = None) -> None:
         ("🛠 Crafting Hub", "pages/09_Crafting_Hub.py"),
         ("🧿 DM Console", "pages/99_DM_Console.py"),
     ]
+
+    # “Rescue rope” in case Streamlit collapses the sidebar UI
+    st.sidebar.page_link("app.py", label="🏠 Home (Navigation)")
+
+    st.sidebar.divider()
 
     for label, target in pages:
         prefix = "➡️ " if (active and label == active) else ""
