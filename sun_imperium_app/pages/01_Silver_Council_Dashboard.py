@@ -32,7 +32,7 @@ st.divider()
 
 # Economy snapshot (from last computed week)
 eco = sb.table("economy_week_summary").select(
-    "population,survival_ratio,player_payout,tax_income,gross_value"
+    "population,survival_ratio,player_payout,tax_income,gross_value,grain_needed,grain_produced,water_needed,water_produced"
 ).eq("week", week).limit(1).execute().data
 
 if eco:
@@ -46,6 +46,16 @@ if eco:
         st.metric("Tax income (total)", f"{float(row.get('tax_income') or 0):,.0f}")
     with e4:
         st.metric("Player payout", f"{float(row.get('player_payout') or 0):,.0f}")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.write(
+            f"**Grain:** {int(row.get('grain_produced') or 0):,} / {float(row.get('grain_needed') or 0):,.0f} needed"
+        )
+    with g2:
+        st.write(
+            f"**Water:** {int(row.get('water_produced') or 0):,} / {float(row.get('water_needed') or 0):,.0f} needed"
+        )
 else:
     st.warning("Economy not computed for this week yet. Use DM Console → Advance Week to generate income.")
 
