@@ -1,31 +1,47 @@
 import streamlit as st
 
-def hide_streamlit_pages_nav_only() -> None:
+
+def hide_default_sidebar_nav() -> None:
+    """Hide Streamlit's built-in multipage navigation list.
+
+    Streamlit's DOM varies across versions, so we use multiple selectors.
+    IMPORTANT: We only hide the *nav list*, never the sidebar container.
     """
-    Hide Streamlit's built-in multipage nav (the 'app / Silver Council…' list)
-    WITHOUT hiding the sidebar itself.
-    """
+
     st.markdown(
         """
         <style>
-          /* Hide Streamlit multipage navigation list (different versions use different containers) */
+          /* Built-in multipage nav list (varies by Streamlit version) */
           section[data-testid="stSidebarNav"] { display: none !important; }
-          nav[aria-label="App pages"] { display: none !important; }
           div[data-testid="stSidebarNav"] { display: none !important; }
+          nav[aria-label="App pages"] { display: none !important; }
+          [data-testid="stSidebarNavItems"] { display: none !important; }
 
-          /* Force the sidebar container + content to remain visible */
-          section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; width: var(--sidebar-width) !important; }
+          /* Keep sidebar container + content visible */
+          section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; }
           [data-testid="stSidebarContent"] { display: block !important; visibility: visible !important; }
-
-          /* Make sure the collapse button still exists */
           button[data-testid="collapsedControl"] { display: block !important; visibility: visible !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+
+def page_config(_title: str, _icon: str = "🌙") -> None:
+    """Backwards-compatible no-op.
+
+    Historically pages called page_config() to show a header.
+    Pages now render their own titles, so this must not print anything
+    (prevents double titles) and MUST NOT call st.set_page_config().
+    """
+
+    return
+
+
 def sidebar(active: str | None = None) -> None:
-    hide_streamlit_pages_nav_only()
+    """Render the custom emoji navigation everywhere."""
+
+    hide_default_sidebar_nav()
 
     st.sidebar.markdown("## 🌙 Sun Imperium")
     st.sidebar.caption("Navigation")
@@ -43,11 +59,16 @@ def sidebar(active: str | None = None) -> None:
         ("🧿 DM Console", "pages/99_DM_Console.py"),
     ]
 
-    # “Rescue rope” in case Streamlit collapses the sidebar UI
-    st.sidebar.page_link("app.py", label="🏠 Home (Navigation)")
-
-    st.sidebar.divider()
+    # Rescue rope
+    try:
+        st.sidebar.page_link("app.py", label="🏠 Home")
+        st.sidebar.divider()
+    except Exception:
+        pass
 
     for label, target in pages:
         prefix = "➡️ " if (active and label == active) else ""
-        st.sidebar.page_link(target, label=f"{prefix}{label}")
+        try:
+            st.sidebar.page_link(target, label=f"{prefix}{label}")
+        except Exception:
+            st.sidebar.write(f"{prefix}{label}")
