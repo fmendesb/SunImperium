@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
 
-from utils.nav import hide_default_sidebar_nav
+from utils.nav import sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 
-hide_default_sidebar_nav()
+sidebar("📖 Legislation")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
