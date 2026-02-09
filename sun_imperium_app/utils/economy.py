@@ -25,18 +25,57 @@ class WeekEconomyResult:
     upkeep_total: float
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def get_settings(sb) -> Dict[str, float]:
-    """Read economy settings. Must exist via SQL seed."""
-    r = sb.table("economy_settings").select("tax_rate,player_share,economy_scale,rand_min,rand_max").limit(1).execute()
+    """Read economy settings. Must exist via SQL seed. Harden against bad values (esp. economy_scale=0)."""
+    r = (
+        sb.table("economy_settings")
+        .select("tax_rate,player_share,economy_scale,rand_min,rand_max")
+        .limit(1)
+        .execute()
+    )
+
+    # Defaults if missing
     if not r.data:
         return {"tax_rate": 0.10, "player_share": 0.20, "economy_scale": 1.0, "rand_min": 0.90, "rand_max": 1.10}
+
     row = r.data[0]
+
+    tax_rate = float(row.get("tax_rate") or 0.10)
+    player_share = float(row.get("player_share") or 0.20)
+    economy_scale = float(row.get("economy_scale") or 1.0)
+    rand_min = float(row.get("rand_min") or 0.90)
+    rand_max = float(row.get("rand_max") or 1.10)
+
+    # ---- Safety clamps (prevents the entire economy from going to zero) ----
+    tax_rate = _clamp(tax_rate, 0.0, 1.0)
+    player_share = _clamp(player_share, 0.0, 1.0)
+
+    # If scale is 0 or negative, treat as 1.0 (most common "0 gold" cause)
+    if economy_scale <= 0:
+        economy_scale = 1.0
+    # prevent ridiculous inflation if someone sets it huge
+    economy_scale = _clamp(economy_scale, 0.01, 100.0)
+
+    # ensure sane randomness bounds
+    if rand_min <= 0:
+        rand_min = 0.90
+    if rand_max <= 0:
+        rand_max = 1.10
+    if rand_max < rand_min:
+        rand_min, rand_max = rand_max, rand_min
+    rand_min = _clamp(rand_min, 0.10, 2.0)
+    rand_max = _clamp(rand_max, 0.10, 3.0)
+
     return {
-        "tax_rate": float(row.get("tax_rate") or 0.10),
-        "player_share": float(row.get("player_share") or 0.20),
-        "economy_scale": float(row.get("economy_scale") or 1.0),
-        "rand_min": float(row.get("rand_min") or 0.90),
-        "rand_max": float(row.get("rand_max") or 1.10),
+        "tax_rate": tax_rate,
+        "player_share": player_share,
+        "economy_scale": economy_scale,
+        "rand_min": rand_min,
+        "rand_max": rand_max,
     }
 
 
@@ -62,13 +101,8 @@ def _stable_rand(week: int, key: str, a: float, b: float) -> float:
     return rng.uniform(a, b)
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
 def _infer_family_from_region(week: int, item_name: str, region: str) -> str:
     r = (region or "").lower()
-    # Normalize apostrophes variants
     r = r.replace("’", "'")
 
     if "val'har" in r or "valhar" in r:
@@ -82,7 +116,6 @@ def _infer_family_from_region(week: int, item_name: str, region: str) -> str:
     if "new triport" in r or "triport" in r:
         return "lathien"
     if "moonglade" in r:
-        # deterministic pick so it doesn't reshuffle every rerun
         choices = ["eladrin", "elenwe", "galadhel"]
         h = hashlib.sha256(f"{week}:{item_name}:{region}".encode("utf-8")).hexdigest()
         return choices[int(h[:2], 16) % len(choices)]
@@ -142,7 +175,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
 
     items = (
         sb.table("gathering_items")
-        .select("name,rarity,base_price_gp,region,family")
+        .select("name,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family")
         .execute()
         .data
         or []
@@ -154,19 +187,33 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
     water_produced = 0
 
     for it in items:
-        name = it["name"]
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+
         rarity = (it.get("rarity") or "").strip()
-        base_price = float(it.get("base_price_gp") or 0)
         region = (it.get("region") or "").strip()
         family = (it.get("family") or "").strip()
+
+        # --- PRICE: prefer base_price_gp, fallback to vendor/sale if needed ---
+        price = (
+            it.get("base_price_gp")
+            or it.get("vendor_price_gp")
+            or it.get("sale_price_gp")
+            or 0
+        )
+        base_price = float(price or 0)
 
         # Backfill missing family (important for reputation -> economy linkage)
         if not family and region:
             family = _infer_family_from_region(week, name, region)
 
-        if name.lower() in {"moonwell water", "moonwell water (t1)", "water"}:
+        nlow = name.lower()
+
+        # --- PRODUCTION RATE ---
+        if nlow in {"moonwell water", "moonwell water (t1)", "water"}:
             prod_rate = WATER_PER_CAPITA
-        elif name.lower() in {"lunar grain", "lunar grain (t1)", "grain"}:
+        elif nlow in {"lunar grain", "lunar grain (t1)", "grain"}:
             prod_rate = GRAIN_PER_CAPITA
         else:
             prod_rate = float(rates.get(rarity, 0.00008))
@@ -183,9 +230,10 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
         value = qty * effective_price
 
         gross_value += value
-        if name.lower().startswith("moonwell water") or name.lower() == "water":
+
+        if nlow.startswith("moonwell water") or nlow == "water":
             water_produced += qty
-        if name.lower().startswith("lunar grain") or name.lower() == "grain":
+        if nlow.startswith("lunar grain") or nlow == "grain":
             grain_produced += qty
 
         per_item.append(
@@ -251,5 +299,6 @@ def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[
             "tax_income": summary.tax_income,
             "player_share": summary.player_share,
             "player_payout": summary.player_payout,
-        }
+        },
+        on_conflict="week",
     ).execute()
