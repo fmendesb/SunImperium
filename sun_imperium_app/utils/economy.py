@@ -30,43 +30,32 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def get_settings(sb) -> Dict[str, float]:
-    """Read economy settings. Must exist via SQL seed. Harden against bad values (esp. economy_scale=0)."""
     r = (
         sb.table("economy_settings")
         .select("tax_rate,player_share,economy_scale,rand_min,rand_max")
         .limit(1)
         .execute()
     )
-
-    # Defaults if missing
     if not r.data:
         return {"tax_rate": 0.10, "player_share": 0.20, "economy_scale": 1.0, "rand_min": 0.90, "rand_max": 1.10}
 
     row = r.data[0]
-
     tax_rate = float(row.get("tax_rate") or 0.10)
     player_share = float(row.get("player_share") or 0.20)
     economy_scale = float(row.get("economy_scale") or 1.0)
     rand_min = float(row.get("rand_min") or 0.90)
     rand_max = float(row.get("rand_max") or 1.10)
 
-    # ---- Safety clamps (prevents the entire economy from going to zero) ----
     tax_rate = _clamp(tax_rate, 0.0, 1.0)
     player_share = _clamp(player_share, 0.0, 1.0)
 
-    # If scale is 0 or negative, treat as 1.0 (most common "0 gold" cause)
+    # scale is allowed to be small, but not <= 0
     if economy_scale <= 0:
         economy_scale = 1.0
-    # prevent ridiculous inflation if someone sets it huge
-    economy_scale = _clamp(economy_scale, 0.01, 100.0)
 
-    # ensure sane randomness bounds
-    if rand_min <= 0:
-        rand_min = 0.90
-    if rand_max <= 0:
-        rand_max = 1.10
     if rand_max < rand_min:
         rand_min, rand_max = rand_max, rand_min
+
     rand_min = _clamp(rand_min, 0.10, 2.0)
     rand_max = _clamp(rand_max, 0.10, 3.0)
 
@@ -83,7 +72,9 @@ def rarity_rates(sb) -> Dict[str, float]:
     r = sb.table("rarity_prod_rates").select("rarity,prod_rate").execute()
     rates: Dict[str, float] = {}
     for row in (r.data or []):
-        rates[(row.get("rarity") or "").strip()] = float(row.get("prod_rate") or 0)
+        key = (row.get("rarity") or "").strip()
+        if key:
+            rates[key] = float(row.get("prod_rate") or 0)
     return rates
 
 
@@ -101,10 +92,15 @@ def _stable_rand(week: int, key: str, a: float, b: float) -> float:
     return rng.uniform(a, b)
 
 
-def _infer_family_from_region(week: int, item_name: str, region: str) -> str:
-    r = (region or "").lower()
-    r = r.replace("’", "'")
+def _stable_unit_random(week: int, key: str) -> float:
+    h = hashlib.sha256(f"u:{week}:{key}".encode("utf-8")).hexdigest()
+    seed = int(h[:8], 16)
+    rng = random.Random(seed)
+    return rng.random()
 
+
+def _infer_family_from_region(week: int, item_name: str, region: str) -> str:
+    r = (region or "").lower().replace("’", "'")
     if "val'har" in r or "valhar" in r:
         return "valar family"
     if "val'heim" in r or "valheim" in r:
@@ -158,11 +154,18 @@ def family_multiplier(sb, week: int, family: str) -> float:
     return _clamp(mult, 0.50, 1.75)
 
 
-def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[str, Any]]]:
-    """Compute weekly production, values, and taxes.
+def _stochastic_int(expected: float, week: int, key: str) -> int:
+    """Turn small expected values into occasional 1s instead of always rounding to 0."""
+    if expected <= 0:
+        return 0
+    base = int(expected)  # floor
+    frac = expected - base
+    if frac <= 0:
+        return base
+    return base + (1 if _stable_unit_random(week, key) < frac else 0)
 
-    Returns (summary, per_item_rows)
-    """
+
+def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[str, Any]]]:
     settings = get_settings(sb)
     rates = rarity_rates(sb)
 
@@ -191,38 +194,39 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
         if not name:
             continue
 
-        rarity = (it.get("rarity") or "").strip()
+        rarity = (it.get("rarity") or "Common").strip()  # default to Common if null
         region = (it.get("region") or "").strip()
         family = (it.get("family") or "").strip()
 
-        # --- PRICE: prefer base_price_gp, fallback to vendor/sale if needed ---
-        price = (
-            it.get("base_price_gp")
-            or it.get("vendor_price_gp")
-            or it.get("sale_price_gp")
-            or 0
-        )
-        base_price = float(price or 0)
-
-        # Backfill missing family (important for reputation -> economy linkage)
         if not family and region:
             family = _infer_family_from_region(week, name, region)
 
         nlow = name.lower()
 
-        # --- PRODUCTION RATE ---
+        # Price: prefer base_price_gp, fallback to vendor/sale
+        price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
+        base_price = float(price or 0)
+
+        # Production rate
         if nlow in {"moonwell water", "moonwell water (t1)", "water"}:
             prod_rate = WATER_PER_CAPITA
+            apply_scale = False  # survival goods are NOT scaled down
         elif nlow in {"lunar grain", "lunar grain (t1)", "grain"}:
             prod_rate = GRAIN_PER_CAPITA
+            apply_scale = False
         else:
             prod_rate = float(rates.get(rarity, 0.00008))
+            apply_scale = True
 
         rm = region_multiplier(sb, week, region) if region else 1.0
         fm = family_multiplier(sb, week, family) if family else 1.0
         rf = _stable_rand(week, name, rand_min, rand_max)
 
-        qty = int(round(pop * prod_rate * scale * rm * fm * rf))
+        expected = pop * prod_rate * rm * fm * rf
+        if apply_scale:
+            expected *= scale
+
+        qty = _stochastic_int(expected, week, f"{name}|{region}|{family}|{rarity}")
         if qty < 0:
             qty = 0
 
@@ -278,7 +282,6 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
 
 
 def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[str, Any]]):
-    # Replace per-item output for that week
     sb.table("economy_week_output").delete().eq("week", summary.week).execute()
     if per_item_rows:
         chunk = 250
