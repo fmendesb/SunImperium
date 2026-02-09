@@ -7,17 +7,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from utils.nav import sidebar, hide_default_sidebar_nav
+from utils.nav import sidebar
 
-# Ensure the custom navigation is visible immediately on the home page too.
-hide_default_sidebar_nav()
-sidebar()
+# Always render the custom nav on the home page too.
+sidebar(None)
 
-st.title("Sun Imperium")
-st.caption("Select a page from the navigation.")
-
-st.info(
-    "If you ever see a 'Failed to fetch dynamically imported module' error after deploying, "
-    "open the app in an incognito window or hard refresh (Ctrl+F5 / Cmd+Shift+R). "
-    "That's a Streamlit Cloud browser cache mismatch, not a server-side bug."
-)
+st.title("🌙 Sun Imperium")
+st.caption("Choose a section from the sidebar.")
