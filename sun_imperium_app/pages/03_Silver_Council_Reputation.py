@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 
-from utils.nav import sidebar
+from utils.nav import sidebar, page_config
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week
 
+page_config("Silver Council | Reputation", "📜")
 sidebar("📜 Reputation")
 
 sb = get_supabase()
@@ -16,14 +17,11 @@ week = get_current_week(sb)
 st.title("📜 Reputation")
 st.caption(f"Week {week}")
 
-# Identify DM state
-is_dm = bool(st.session_state.get("is_dm", False))
-
 # Filters
 filter_view = st.radio("Show", ["All", "Regions", "Families"], horizontal=True)
+
+# Hidden reputations are controlled from DM Console. This page is player-facing.
 show_hidden = False
-if is_dm:
-    show_hidden = st.toggle("Show hidden (DM only)", value=False)
 
 
 def dc_bonus_from_score(score: int) -> tuple[int, int]:
@@ -91,7 +89,6 @@ for f in factions:
             "Type": f.get("type"),
             "Score": score,
             "DC": dc,
-            "Bonus": bonus,
             "Notes": r.get("note") or "",
             "_faction_id": fid,
         }
@@ -111,7 +108,6 @@ edited = st.data_editor(
         "Faction": st.column_config.TextColumn(disabled=True),
         "Type": st.column_config.TextColumn(disabled=True),
         "DC": st.column_config.NumberColumn(disabled=True),
-        "Bonus": st.column_config.NumberColumn(disabled=True),
     },
     key="rep_editor",
 )
