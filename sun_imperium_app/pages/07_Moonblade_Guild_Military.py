@@ -221,8 +221,31 @@ with tab_squads:
     label = st.selectbox("Select squad", list(squad_options.keys()), key="squad_select")
     squad = squad_options[label]
 
-    # Load members
-    members = sb.table("squad_members").select("id,unit_id,unit_type,quantity").eq("squad_id", squad["id"]).execute().data or []
+    # Load members (be defensive: older schemas may not have unit_type yet)
+    try:
+        members = (
+            sb.table("squad_members")
+            .select("id,unit_id,unit_type,quantity")
+            .eq("squad_id", squad["id"])
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        # Fallback: only unit_id/quantity exist.
+        members = (
+            sb.table("squad_members")
+            .select("id,unit_id,quantity")
+            .eq("squad_id", squad["id"])
+            .execute()
+            .data
+            or []
+        )
+        # Backfill unit_type from unit catalog so the UI + war sim stay consistent.
+        for m in members:
+            uid = m.get("unit_id")
+            u = unit_by_id.get(uid) if uid else None
+            m["unit_type"] = (u.get("unit_type") if u else None) or "Other"
 
     def compute_squad_power(ms: list[dict]) -> float:
         power_total = 0.0
