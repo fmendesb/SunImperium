@@ -4,6 +4,7 @@ from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals
+from utils import infrastructure_effects
 
 
 page_config("Silver Council | Dashboard", "🏛️")
@@ -38,8 +39,32 @@ eco = sb.table("economy_week_summary").select(
 if eco:
     row = eco[0]
     e1, e2, e3, e4 = st.columns(4)
+    # Population trend (from population_state if present)
+    pop_now = int(row.get("population") or 0)
+    pop_prev = None
+    try:
+        prev = (
+            sb.table("population_state")
+            .select("population")
+            .eq("week", max(1, week - 1))
+            .limit(1)
+            .execute()
+            .data
+        )
+        if prev:
+            pop_prev = int(prev[0].get("population") or 0)
+    except Exception:
+        pop_prev = None
+
+    # Satisfaction is a lightweight proxy: social infrastructure + survival.
+    social_bonus = infrastructure_effects.social_bonus_total(sb)
+    surv = float(row.get("survival_ratio") or 0)
+    # Simple mapping into a readable 0..100 band.
+    satisfaction = max(0.0, min(100.0, 50.0 + social_bonus * 8.0 + (surv - 1.0) * 40.0))
+
     with e1:
-        st.metric("Population", f"{int(row.get('population') or 0):,}")
+        delta = None if pop_prev is None else pop_now - pop_prev
+        st.metric("Population", f"{pop_now:,}", delta=None if delta is None else f"{delta:+,}")
     with e2:
         st.metric("Survival ratio", f"{float(row.get('survival_ratio') or 0):.2f}")
     with e3:
@@ -56,6 +81,16 @@ if eco:
         st.write(
             f"**Water:** {int(row.get('water_produced') or 0):,} / {float(row.get('water_needed') or 0):,.0f} needed"
         )
+
+    st.divider()
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.metric("Satisfaction", f"{satisfaction:,.0f}/100")
+    with s2:
+        st.metric("Social infrastructure", f"+{social_bonus:.0f}")
+    with s3:
+        prod_mult = infrastructure_effects.production_multiplier_total(sb)
+        st.metric("Production multiplier", f"x{prod_mult:.2f}")
 else:
     st.warning("Economy not computed for this week yet. Use DM Console → Advance Week to generate income.")
 
