@@ -61,7 +61,10 @@ def fetch_squad_member_rows(squad_id) -> list[dict]:
     We prefer unit_id-based membership (players recruit specific units). Some schemas also store unit_type.
     We normalize the returned rows to always include: id, unit_id, unit_type, quantity.
     """
-    # Try the richest select first
+    # Try the richest select first.
+    # NOTE: PostgREST raises hard errors if a selected column doesn't exist.
+    # We progressively fall back across known schema variants.
+    rows: list[dict] = []
     try:
         rows = (
             sb.table("squad_members")
@@ -72,18 +75,29 @@ def fetch_squad_member_rows(squad_id) -> list[dict]:
             or []
         )
     except Exception:
-        # Fallback: no unit_type column
-        rows = (
-            sb.table("squad_members")
-            .select("id,unit_id,quantity")
-            .eq("squad_id", squad_id)
-            .execute()
-            .data
-            or []
-        )
+        try:
+            rows = (
+                sb.table("squad_members")
+                .select("id,unit_id,quantity")
+                .eq("squad_id", squad_id)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            # Oldest fallback: only unit_type stored.
+            rows = (
+                sb.table("squad_members")
+                .select("id,unit_type,quantity")
+                .eq("squad_id", squad_id)
+                .execute()
+                .data
+                or []
+            )
 
     for r in rows:
         r["unit_type"] = (r.get("unit_type") or UNIT_TYPE_BY_ID.get(r.get("unit_id"), "Other"))
+        r.setdefault("unit_id", None)
     return rows
 
 
