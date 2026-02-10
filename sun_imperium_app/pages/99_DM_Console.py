@@ -8,6 +8,7 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
+from utils.squads import fetch_members, upsert_member
 
 page_config("DM Console", "🔮")
 sidebar("🔮 DM Console")
@@ -235,7 +236,13 @@ with enemy_tab:
                 if not squad_name.strip():
                     st.error("Please enter a name.")
                 else:
-                    sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip(), "is_enemy": True}).execute()
+                    # Backward-compatible: some schemas don't have is_enemy yet.
+                    try:
+                        sb.table("squads").insert(
+                            {"name": squad_name.strip(), "region": region.strip(), "is_enemy": True}
+                        ).execute()
+                    except Exception:
+                        sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip()}).execute()
                     st.success("Enemy squad created.")
                     st.rerun()
 
@@ -247,37 +254,9 @@ with enemy_tab:
                 options=enemy_squads,
                 format_func=lambda r: r.get("name") or "(unnamed)",
             )
-
-            # Squad member schemas vary across installs. PostgREST hard-errors on unknown columns,
-            # so we progressively fall back.
-            try:
-                members = (
-                    sb.table("squad_members")
-                    .select("id,unit_id,unit_type,quantity")
-                    .eq("squad_id", squad["id"])
-                    .execute()
-                    .data
-                    or []
-                )
-            except Exception:
-                try:
-                    members = (
-                        sb.table("squad_members")
-                        .select("id,unit_id,quantity")
-                        .eq("squad_id", squad["id"])
-                        .execute()
-                        .data
-                        or []
-                    )
-                except Exception:
-                    members = (
-                        sb.table("squad_members")
-                        .select("id,unit_type,quantity")
-                        .eq("squad_id", squad["id"])
-                        .execute()
-                        .data
-                        or []
-                    )
+            # Load members (schema-tolerant)
+            unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
+            members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id)
 
             unit_by_id = {u["id"]: u for u in units}
             rows = []
@@ -301,54 +280,13 @@ with enemy_tab:
             qty_add = st.number_input("Add qty", min_value=1, max_value=999, value=1, key="enemy_add_qty")
 
             if st.button("Add to enemy squad", key="enemy_add_btn"):
-                qty_add_i = int(qty_add)
-                ut = (pick.get("unit_type") or "Other")
-
-                # 1) Try unit_id-based membership
-                try:
-                    existing = (
-                        sb.table("squad_members")
-                        .select("id,quantity")
-                        .eq("squad_id", squad["id"])
-                        .eq("unit_id", pick["id"])
-                        .limit(1)
-                        .execute()
-                        .data
-                    )
-                    if existing:
-                        sb.table("squad_members").update(
-                            {"quantity": int(existing[0]["quantity"]) + qty_add_i}
-                        ).eq("id", existing[0]["id"]).execute()
-                    else:
-                        # unit_type may not exist; try rich payload then fall back
-                        try:
-                            sb.table("squad_members").insert(
-                                {"squad_id": squad["id"], "unit_id": pick["id"], "unit_type": ut, "quantity": qty_add_i}
-                            ).execute()
-                        except Exception:
-                            sb.table("squad_members").insert(
-                                {"squad_id": squad["id"], "unit_id": pick["id"], "quantity": qty_add_i}
-                            ).execute()
-                except Exception:
-                    # 2) Fallback: unit_type-only membership
-                    existing = (
-                        sb.table("squad_members")
-                        .select("id,quantity")
-                        .eq("squad_id", squad["id"])
-                        .eq("unit_type", ut)
-                        .limit(1)
-                        .execute()
-                        .data
-                    )
-                    if existing:
-                        sb.table("squad_members").update(
-                            {"quantity": int(existing[0]["quantity"]) + qty_add_i}
-                        ).eq("id", existing[0]["id"]).execute()
-                    else:
-                        sb.table("squad_members").insert(
-                            {"squad_id": squad["id"], "unit_type": ut, "quantity": qty_add_i}
-                        ).execute()
-
+                upsert_member(
+                    sb,
+                    squad_id=squad["id"],
+                    qty_delta=int(qty_add),
+                    unit_id=pick.get("id"),
+                    unit_type=(pick.get("unit_type") or "Other"),
+                )
                 st.success("Added.")
                 st.rerun()
 
