@@ -6,6 +6,7 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils.squads import fetch_members, upsert_member
 
 UNDO_CATEGORY = "moonblade"
 
@@ -221,44 +222,9 @@ with tab_squads:
     label = st.selectbox("Select squad", list(squad_options.keys()), key="squad_select")
     squad = squad_options[label]
 
-    # Load members (schemas vary; PostgREST hard-errors on unknown columns)
-    try:
-        members = (
-            sb.table("squad_members")
-            .select("id,unit_id,unit_type,quantity")
-            .eq("squad_id", squad["id"])
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        try:
-            # Variant: unit_id only
-            members = (
-                sb.table("squad_members")
-                .select("id,unit_id,quantity")
-                .eq("squad_id", squad["id"])
-                .execute()
-                .data
-                or []
-            )
-        except Exception:
-            # Oldest variant: unit_type only
-            members = (
-                sb.table("squad_members")
-                .select("id,unit_type,quantity")
-                .eq("squad_id", squad["id"])
-                .execute()
-                .data
-                or []
-            )
-
-    # Backfill missing fields for downstream code
-    for m in members:
-        uid = m.get("unit_id")
-        u = unit_by_id.get(uid) if uid else None
-        m["unit_type"] = (m.get("unit_type") or (u.get("unit_type") if u else None) or "Other")
-        m.setdefault("unit_id", uid)
+    # Load members (schema-tolerant)
+    unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
+    members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id)
 
     def compute_squad_power(ms: list[dict]) -> float:
         power_total = 0.0
@@ -346,53 +312,17 @@ with tab_squads:
             sb.table("moonblade_roster").upsert(
                 {"unit_id": chosen["id"], "quantity": max_add - int(qty_add)}
             ).execute()
-            qty_add_i = int(qty_add)
-            ut = (chosen.get('unit_type') or 'Other')
 
-            # upsert member (schemas vary: unit_id-based or unit_type-only)
-            try:
-                existing = (
-                    sb.table('squad_members')
-                    .select('id,quantity')
-                    .eq('squad_id', squad['id'])
-                    .eq('unit_id', chosen['id'])
-                    .limit(1)
-                    .execute()
-                    .data
-                )
-                if existing:
-                    sb.table('squad_members').update(
-                        {'quantity': int(existing[0]['quantity']) + qty_add_i}
-                    ).eq('id', existing[0]['id']).execute()
-                else:
-                    try:
-                        sb.table('squad_members').insert(
-                            {'squad_id': squad['id'], 'unit_id': chosen['id'], 'unit_type': ut, 'quantity': qty_add_i}
-                        ).execute()
-                    except Exception:
-                        sb.table('squad_members').insert(
-                            {'squad_id': squad['id'], 'unit_id': chosen['id'], 'quantity': qty_add_i}
-                        ).execute()
-            except Exception:
-                existing = (
-                    sb.table('squad_members')
-                    .select('id,quantity')
-                    .eq('squad_id', squad['id'])
-                    .eq('unit_type', ut)
-                    .limit(1)
-                    .execute()
-                    .data
-                )
-                if existing:
-                    sb.table('squad_members').update(
-                        {'quantity': int(existing[0]['quantity']) + qty_add_i}
-                    ).eq('id', existing[0]['id']).execute()
-                else:
-                    sb.table('squad_members').insert(
-                        {'squad_id': squad['id'], 'unit_type': ut, 'quantity': qty_add_i}
-                    ).execute()
+            # upsert member (schema-tolerant)
+            upsert_member(
+                sb,
+                squad_id=squad["id"],
+                qty_delta=int(qty_add),
+                unit_id=chosen.get("id"),
+                unit_type=(chosen.get("unit_type") or "Other"),
+            )
 
-            st.success('Assigned.')
+            st.success("Assigned.")
             st.rerun()
 
 st.info("War Simulator: pick a friendly squad and an enemy squad (DM-created) to resolve battles.")
