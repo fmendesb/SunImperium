@@ -6,6 +6,7 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
+from utils import infrastructure_effects
 
 UNDO_CATEGORY = "infrastructure"
 
@@ -99,7 +100,12 @@ for _, r in df.iterrows():
         left, right = st.columns([3, 1])
         with left:
             st.subheader(r["Name"])
-            st.write(r["Description"])
+            desc = r["Description"] or ""
+            eff = infrastructure_effects.describe_infrastructure_effect(r["Name"])
+            if eff:
+                st.caption(f"Effect: {eff}")
+            if desc:
+                st.write(desc)
             st.write(f"**Cost:** {r['Cost']:,.0f} · **Upkeep:** {r['Upkeep']:,.0f}")
             if r["Prereq"]:
                 st.caption(f"Prerequisite: {r['Prereq']}")
