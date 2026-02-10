@@ -47,6 +47,53 @@ sb = get_supabase()
 ensure_bootstrap(sb)
 week = get_current_week(sb)
 
+# Cache unit catalog so we can infer unit_type when squad_members only stores unit_id
+try:
+    _units = sb.table("moonblade_units").select("id,unit_type").execute().data or []
+except Exception:
+    _units = []
+UNIT_TYPE_BY_ID = {u.get("id"): (u.get("unit_type") or "Other") for u in _units}
+
+
+def fetch_squad_member_rows(squad_id) -> list[dict]:
+    """Fetch squad member rows.
+
+    We prefer unit_id-based membership (players recruit specific units). Some schemas also store unit_type.
+    We normalize the returned rows to always include: id, unit_id, unit_type, quantity.
+    """
+    # Try the richest select first
+    try:
+        rows = (
+            sb.table("squad_members")
+            .select("id,unit_id,unit_type,quantity")
+            .eq("squad_id", squad_id)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        # Fallback: no unit_type column
+        rows = (
+            sb.table("squad_members")
+            .select("id,unit_id,quantity")
+            .eq("squad_id", squad_id)
+            .execute()
+            .data
+            or []
+        )
+
+    for r in rows:
+        r["unit_type"] = (r.get("unit_type") or UNIT_TYPE_BY_ID.get(r.get("unit_id"), "Other"))
+    return rows
+
+
+def rows_agg_for_display(rows: list[dict]) -> list[dict]:
+    """Reduce detailed unit rows into unit_type buckets for the sim."""
+    out: list[dict] = []
+    for r in rows or []:
+        out.append({"unit_type": r.get("unit_type"), "quantity": r.get("quantity")})
+    return out
+
 st.title("🩸 War Simulator")
 st.caption(
     "Pick a friendly squad and (optionally) an enemy squad created by the DM. "
@@ -85,15 +132,8 @@ squad_choice = st.selectbox(
     format_func=lambda r: f"{r.get('name')}" + (f" · {r.get('region')}" if r.get("region") else ""),
 )
 
-members = (
-    sb.table("squad_members")
-    .select("unit_type,quantity")
-    .eq("squad_id", squad_choice["id"])
-    .execute()
-    .data
-    or []
-)
-ally = rows_to_force(members)
+ally_rows = fetch_squad_member_rows(squad_choice["id"])
+ally = rows_to_force(rows_agg_for_display(ally_rows))
 
 st.subheader("Friendly force")
 colA, colB, colC, colD, colE = st.columns(5)
@@ -119,15 +159,8 @@ if use_enemy_squad and enemy_squads:
         options=enemy_squads,
         format_func=lambda r: f"{r.get('name')}" + (f" · {r.get('region')}" if r.get("region") else ""),
     )
-    e_members = (
-        sb.table("squad_members")
-        .select("unit_type,quantity")
-        .eq("squad_id", enemy_squad_choice["id"])
-        .execute()
-        .data
-        or []
-    )
-    enemy = rows_to_force(e_members)
+    enemy_rows = fetch_squad_member_rows(enemy_squad_choice["id"])
+    enemy = rows_to_force(rows_agg_for_display(enemy_rows))
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Guardians", enemy.guardians)
@@ -203,22 +236,62 @@ apply_enemy = bool(enemy_squad_choice)
 st.caption("Applies remaining counts to squad(s). If an enemy squad is selected, it will be updated too.")
 
 if st.button("Apply to squads", type="secondary"):
+    def apply_remaining_to_rows(squad_id, rows: list[dict], remaining_by_type: dict):
+        """Apply remaining counts to detailed (unit_id-based) squad rows.
+
+        We reduce each unit_type bucket proportionally across the underlying unit rows.
+        This avoids requiring a unit_type-only schema and keeps recruitment-by-unit intact.
+        """
+        # Group current rows by unit_type
+        by_type: dict[str, list[dict]] = {}
+        for r in rows:
+            t = (r.get("unit_type") or "Other")
+            by_type.setdefault(t, []).append(r)
+
+        for t, rlist in by_type.items():
+            cur_total = sum(int(x.get("quantity") or 0) for x in rlist)
+            target = int(remaining_by_type.get(t, 0))
+            if cur_total <= 0:
+                continue
+            if target < 0:
+                target = 0
+
+            # Scale quantities
+            ratio = target / cur_total
+            new_q = []
+            for x in rlist:
+                q = int(x.get("quantity") or 0)
+                nq = int(q * ratio)
+                new_q.append(nq)
+
+            # Distribute leftover to reach exact target (deterministic order)
+            leftover = target - sum(new_q)
+            if leftover > 0:
+                # Give +1 to the first N rows
+                for i in range(min(leftover, len(new_q))):
+                    new_q[i] += 1
+            elif leftover < 0:
+                # Remove 1 from rows that still have >0
+                to_remove = -leftover
+                for i in range(len(new_q)):
+                    if to_remove <= 0:
+                        break
+                    if new_q[i] > 0:
+                        new_q[i] -= 1
+                        to_remove -= 1
+
+            # Persist
+            for x, nq in zip(rlist, new_q):
+                sb.table("squad_members").update({"quantity": int(nq)}).eq("id", x["id"]).execute()
+
     # Friendly squad update
     remaining_ally = result.ally_remaining.as_dict()
-    for unit_type, qty in remaining_ally.items():
-        sb.table("squad_members").upsert(
-            {"squad_id": squad_choice["id"], "unit_type": unit_type, "quantity": int(qty)},
-            on_conflict="squad_id,unit_type",
-        ).execute()
+    apply_remaining_to_rows(squad_choice["id"], ally_rows, remaining_ally)
 
     # Enemy squad update (if used)
     if apply_enemy and enemy_squad_choice is not None:
         remaining_enemy = result.enemy_remaining.as_dict()
-        for unit_type, qty in remaining_enemy.items():
-            sb.table("squad_members").upsert(
-                {"squad_id": enemy_squad_choice["id"], "unit_type": unit_type, "quantity": int(qty)},
-                on_conflict="squad_id,unit_type",
-            ).execute()
+        apply_remaining_to_rows(enemy_squad_choice["id"], enemy_rows, remaining_enemy)
 
     # War log (best-effort across schema variants)
     war_row = {
