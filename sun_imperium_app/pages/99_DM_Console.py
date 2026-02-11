@@ -8,7 +8,7 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
-from utils.squads import fetch_members, upsert_member
+from utils.squads import detect_member_caps, fetch_members, bulk_add_members
 
 page_config("DM Console", "🔮")
 sidebar("🔮 DM Console")
@@ -236,13 +236,7 @@ with enemy_tab:
                 if not squad_name.strip():
                     st.error("Please enter a name.")
                 else:
-                    # Backward-compatible: some schemas don't have is_enemy yet.
-                    try:
-                        sb.table("squads").insert(
-                            {"name": squad_name.strip(), "region": region.strip(), "is_enemy": True}
-                        ).execute()
-                    except Exception:
-                        sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip()}).execute()
+                    sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip(), "is_enemy": True}).execute()
                     st.success("Enemy squad created.")
                     st.rerun()
 
@@ -254,11 +248,13 @@ with enemy_tab:
                 options=enemy_squads,
                 format_func=lambda r: r.get("name") or "(unnamed)",
             )
-            # Load members (schema-tolerant)
-            unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
-            members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id)
 
             unit_by_id = {u["id"]: u for u in units}
+            unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
+
+            caps = detect_member_caps(sb)
+            members, _ = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id, _caps=caps)
+
             rows = []
             for m in members:
                 u = unit_by_id.get(m.get("unit_id"))
@@ -271,24 +267,51 @@ with enemy_tab:
                 st.caption("No members yet.")
 
             st.markdown("#### Add units")
-            pick = st.selectbox(
-                "Unit",
-                options=units,
-                format_func=lambda u: f"{u['name']} ({u.get('unit_type') or 'Other'})",
-                key="enemy_pick_unit",
-            )
-            qty_add = st.number_input("Add qty", min_value=1, max_value=999, value=1, key="enemy_add_qty")
+            st.caption("Enter quantities for multiple units, then click **Add selected** once.")
 
-            if st.button("Add to enemy squad", key="enemy_add_btn"):
-                upsert_member(
-                    sb,
-                    squad_id=squad["id"],
-                    qty_delta=int(qty_add),
-                    unit_id=pick.get("id"),
-                    unit_type=(pick.get("unit_type") or "Other"),
-                )
-                st.success("Added.")
-                st.rerun()
+            df = pd.DataFrame(
+                [
+                    {
+                        "Unit": u.get("name"),
+                        "Type": (u.get("unit_type") or "Other"),
+                        "Power": float(u.get("power") or 0),
+                        "Add": 0,
+                        "_unit_id": u["id"],
+                    }
+                    for u in units
+                ]
+            )
+
+            edited = st.data_editor(
+                df[["Unit", "Type", "Power", "Add"]],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Power": st.column_config.NumberColumn(disabled=True),
+                    "Add": st.column_config.NumberColumn(min_value=0, step=1),
+                },
+                key="enemy_add_editor",
+            )
+
+            if st.button("Add selected", type="primary", key="enemy_add_selected"):
+                adds = []
+                for i, row in edited.iterrows():
+                    add_qty = int(row.get("Add") or 0)
+                    if add_qty <= 0:
+                        continue
+                    adds.append(
+                        {
+                            "unit_id": df.iloc[i]["_unit_id"],
+                            "unit_type": str(df.iloc[i]["Type"]),
+                            "qty": add_qty,
+                        }
+                    )
+                if adds:
+                    bulk_add_members(sb, squad["id"], adds, caps)
+                    st.success("Added.")
+                    st.rerun()
+                else:
+                    st.info("Nothing to add.")
 
 # --- Advance week ---
 with week_tab:
