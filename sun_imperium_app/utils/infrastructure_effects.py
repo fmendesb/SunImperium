@@ -130,23 +130,97 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
     return bonus
 
 
-def production_multiplier(sb: Client) -> float:
-    """Global production multiplier from owned resource infrastructure."""
-    owned_names = get_owned_infrastructure_names(sb)
+def describe_infrastructure_effect(name: str) -> str:
+    """Human-friendly effect string for UI."""
+    effs = EFFECTS.get((name or "").strip())
+    if not effs:
+        return ""
+    parts: list[str] = []
+    for e in effs:
+        kind = e.get("kind")
+        target = (e.get("target") or "").replace("_", " ")
+        value = e.get("value")
+        if kind == "power_bonus":
+            parts.append(f"+{value} {target} power")
+        elif kind == "success_bonus":
+            parts.append(f"+{value}% {target} success")
+        elif kind == "production_bonus":
+            parts.append(f"+{value}% economy output")
+        elif kind == "social_bonus":
+            parts.append(f"+{value} social points")
+        elif kind == "multiplier":
+            # e.g., x1.05
+            try:
+                parts.append(f"x{float(value):.2f} {target}")
+            except Exception:
+                parts.append(f"x{value} {target}")
+        else:
+            parts.append(f"{kind}: {value} {target}".strip())
+    return " · ".join(parts)
+
+
+def _owned_names(sb) -> list[str]:
+    try:
+        rows = sb.table("infrastructure_owned").select("name").execute().data or []
+        return [str(r.get("name") or "").strip() for r in rows if r.get("name")]
+    except Exception:
+        return []
+
+
+def production_multiplier_owned(sb) -> float:
     mult = 1.0
-    for name in owned_names:
-        eff = effect_for_infrastructure(name)
-        if eff and eff.kind == "multiplier" and eff.target == "production":
-            mult *= float(eff.value)
+    for name in _owned_names(sb):
+        for e in EFFECTS.get(name, []):
+            if e.get("kind") == "multiplier" and e.get("target") in {"production", "economy"}:
+                try:
+                    mult *= float(e.get("value") or 1.0)
+                except Exception:
+                    pass
+            if e.get("kind") == "production_bonus":
+                try:
+                    mult *= 1.0 + (float(e.get("value") or 0.0) / 100.0)
+                except Exception:
+                    pass
     return float(mult)
 
 
-def social_points(sb: Client) -> int:
-    """Total social points from owned social infrastructure."""
-    owned_names = get_owned_infrastructure_names(sb)
+def social_points_owned(sb) -> int:
     pts = 0
-    for name in owned_names:
-        eff = effect_for_infrastructure(name)
-        if eff and eff.kind == "social_bonus" and eff.target == "social":
-            pts += int(eff.value)
+    for name in _owned_names(sb):
+        for e in EFFECTS.get(name, []):
+            if e.get("kind") == "social_bonus":
+                try:
+                    pts += int(e.get("value") or 0)
+                except Exception:
+                    pass
+    return int(pts)
+
+
+def production_multiplier_all(sb=None) -> float:
+    """Baseline assumes all infrastructure is owned (optimistic baseline)."""
+    mult = 1.0
+    for name, effs in EFFECTS.items():
+        for e in effs:
+            if e.get("kind") == "multiplier" and e.get("target") in {"production", "economy"}:
+                try:
+                    mult *= float(e.get("value") or 1.0)
+                except Exception:
+                    pass
+            if e.get("kind") == "production_bonus":
+                try:
+                    mult *= 1.0 + (float(e.get("value") or 0.0) / 100.0)
+                except Exception:
+                    pass
+    return float(mult)
+
+
+def social_points_all(sb=None) -> int:
+    pts = 0
+    for name, effs in EFFECTS.items():
+        for e in effs:
+            if e.get("kind") == "social_bonus":
+                try:
+                    pts += int(e.get("value") or 0)
+                except Exception:
+                    pass
     return int(pts)
