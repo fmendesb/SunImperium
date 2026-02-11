@@ -3,6 +3,9 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+from utils.infrastructure_effects import production_multiplier as infra_production_multiplier
+from utils.infrastructure_effects import social_points as infra_social_points
+
 # --- Canonical Week-1 constants (from DM) ---
 GRAIN_PER_CAPITA = 0.006  # 2700 / 450_000
 WATER_PER_CAPITA = 0.004  # 1800 / 450_000
@@ -332,7 +335,25 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
     avg_prod = _avg_region_production(sb, week)
     avg_rep = _avg_family_reputation(sb, week)
 
+    # Global infrastructure modifiers
+    # - Resource infrastructure boosts production throughput (more goods move even in war)
+    # - Social infrastructure slightly improves resilience (confidence/organization)
+    prod_mult = 1.0
+    social_pts = 0
+    try:
+        prod_mult = float(infra_production_multiplier(sb) or 1.0)
+    except Exception:
+        prod_mult = 1.0
+    try:
+        social_pts = int(infra_social_points(sb) or 0)
+    except Exception:
+        social_pts = 0
+
     recovery_factor = _clamp(0.35 + 0.06 * avg_prod + 0.04 * avg_rep, 0.15, 1.75)
+    recovery_factor *= _clamp(prod_mult, 0.75, 6.0)
+    # Social points are a small, gentle global boost
+    recovery_factor *= _clamp(1.0 + 0.03 * float(social_pts), 0.85, 1.35)
+    recovery_factor = _clamp(recovery_factor, 0.10, 6.0)
 
     war = settings["war_severity"]
     # scarcity: high at war, decreases with recovery
@@ -425,7 +446,10 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
 
     # Base demand: population-driven spending capacity
     spend_per_capita = float(settings["spend_per_capita"])
-    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
+    # Social points modestly increase demand capacity (gentle).
+    social_factor = _clamp(1.0 + 0.05 * float(social_pts), 0.75, 1.75)
+
+    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability * social_factor
 
     # Additional global scale (kept for DM control)
     demand_budget *= float(settings["economy_scale"])
@@ -453,7 +477,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
             )
 
             # Recompute budget with calibrated spend
-            demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
+    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
             demand_budget *= float(settings["economy_scale"])
             demand_budget *= _stable_rand(week, "TOTAL_DEMAND", rand_min, rand_max)
 
