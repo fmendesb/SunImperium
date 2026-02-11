@@ -8,7 +8,6 @@ from utils.state import ensure_bootstrap
 from utils.dm import dm_gate
 from utils.ledger import get_current_week, set_current_week, add_ledger_entry
 from utils import economy
-from utils.squads import detect_member_caps, fetch_members, bulk_add_members
 
 page_config("DM Console", "🔮")
 sidebar("🔮 DM Console")
@@ -249,12 +248,16 @@ with enemy_tab:
                 format_func=lambda r: r.get("name") or "(unnamed)",
             )
 
+            members = (
+                sb.table("squad_members")
+                .select("id,unit_id,unit_type,quantity")
+                .eq("squad_id", squad["id"])
+                .execute()
+                .data
+                or []
+            )
+
             unit_by_id = {u["id"]: u for u in units}
-            unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
-
-            caps = detect_member_caps(sb)
-            members, _ = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id, _caps=caps)
-
             rows = []
             for m in members:
                 u = unit_by_id.get(m.get("unit_id"))
@@ -267,51 +270,40 @@ with enemy_tab:
                 st.caption("No members yet.")
 
             st.markdown("#### Add units")
-            st.caption("Enter quantities for multiple units, then click **Add selected** once.")
-
-            df = pd.DataFrame(
-                [
-                    {
-                        "Unit": u.get("name"),
-                        "Type": (u.get("unit_type") or "Other"),
-                        "Power": float(u.get("power") or 0),
-                        "Add": 0,
-                        "_unit_id": u["id"],
-                    }
-                    for u in units
-                ]
+            pick = st.selectbox(
+                "Unit",
+                options=units,
+                format_func=lambda u: f"{u['name']} ({u.get('unit_type') or 'Other'})",
+                key="enemy_pick_unit",
             )
+            qty_add = st.number_input("Add qty", min_value=1, max_value=999, value=1, key="enemy_add_qty")
 
-            edited = st.data_editor(
-                df[["Unit", "Type", "Power", "Add"]],
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "Power": st.column_config.NumberColumn(disabled=True),
-                    "Add": st.column_config.NumberColumn(min_value=0, step=1),
-                },
-                key="enemy_add_editor",
-            )
-
-            if st.button("Add selected", type="primary", key="enemy_add_selected"):
-                adds = []
-                for i, row in edited.iterrows():
-                    add_qty = int(row.get("Add") or 0)
-                    if add_qty <= 0:
-                        continue
-                    adds.append(
-                        {
-                            "unit_id": df.iloc[i]["_unit_id"],
-                            "unit_type": str(df.iloc[i]["Type"]),
-                            "qty": add_qty,
-                        }
-                    )
-                if adds:
-                    bulk_add_members(sb, squad["id"], adds, caps)
-                    st.success("Added.")
-                    st.rerun()
+            if st.button("Add to enemy squad", key="enemy_add_btn"):
+                # best-effort: emulate composite upsert
+                existing = (
+                    sb.table("squad_members")
+                    .select("id,quantity")
+                    .eq("squad_id", squad["id"])
+                    .eq("unit_id", pick["id"])
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                if existing:
+                    sb.table("squad_members").update(
+                        {"quantity": int(existing[0]["quantity"]) + int(qty_add)}
+                    ).eq("id", existing[0]["id"]).execute()
                 else:
-                    st.info("Nothing to add.")
+                    sb.table("squad_members").insert(
+                        {
+                            "squad_id": squad["id"],
+                            "unit_id": pick["id"],
+                            "unit_type": (pick.get("unit_type") or "Other"),
+                            "quantity": int(qty_add),
+                        }
+                    ).execute()
+                st.success("Added.")
+                st.rerun()
 
 # --- Advance week ---
 with week_tab:
@@ -359,11 +351,48 @@ with week_tab:
 
         set_current_week(sb, next_week)
 
-        # Carry forward population (survival can reduce it)
+        # Carry forward population (gentle change)
+        # - Survival ratio nudges population (small %)
+        # - War casualties (from this week's war logs) reduce population
         try:
             pop_now = int(getattr(summary, "population", 450_000) or 450_000)
             surv = float(getattr(summary, "survival_ratio", 1.0) or 1.0)
-            pop_next = max(0, int(round(pop_now * surv)))
+
+            # 1) Survival effect (gentle)
+            # At 0.0 survival, population shouldn't instantly evaporate.
+            # Clamp to [-1.0%, +0.3%] per week from food/water alone.
+            surv = max(0.0, min(1.25, surv))
+            surv_pct = (surv - 1.0) * 0.005
+            surv_pct = max(-0.01, min(0.003, surv_pct))
+
+            # 2) Social effect (gentle bonus)
+            social_pts = 0
+            try:
+                from utils.infrastructure_effects import social_points as _social_points
+
+                social_pts = int(_social_points(sb) or 0)
+            except Exception:
+                social_pts = 0
+            social_pts = max(0, social_pts)
+            social_pct = min(0.002, 0.0005 * float(social_pts))
+
+            # 3) War casualties (best-effort from `wars.result` JSON)
+            war_dead = 0
+            try:
+                wars = sb.table("wars").select("result").eq("week", week).execute().data or []
+                for w in wars:
+                    res = w.get("result") or {}
+                    ac = res.get("ally_casualties") or {}
+                    if isinstance(ac, dict):
+                        war_dead += sum(int(v or 0) for v in ac.values())
+            except Exception:
+                war_dead = 0
+            # Cap war impact at 0.5% weekly (to keep it gentle)
+            war_dead = min(int(war_dead), int(pop_now * 0.005))
+
+            pop_after_pct = int(round(pop_now * (1.0 + surv_pct + social_pct)))
+            pop_next = max(0, pop_after_pct - war_dead)
+
             sb.table("population_state").upsert({"week": next_week, "population": pop_next}, on_conflict="week").execute()
         except Exception:
             pass
