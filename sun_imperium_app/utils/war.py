@@ -87,12 +87,42 @@ def compute_power(force: Force, *, vs: Optional[Force] = None) -> float:
     return core
 
 
-def clamp_force_min_one(force: Force) -> Force:
+def clamp_force_min_one(force: Force, *, original: Optional[Force] = None) -> Force:
+    """Ensure a battle never results in *absolute* annihilation.
+
+    Old behavior forced a surviving "others: 1" even if the force was entirely mages,
+    which felt weird in UI ("my mages died but I got others: 1").
+
+    New behavior: if the post-casualty total would be 0, we keep 1 survivor in the
+    most representative bucket from the *original* force (if provided). Otherwise,
+    we fall back to "others".
+    """
     total = force.guardians + force.archers + force.mages + force.clerics + force.others
-    if total <= 0:
-        # ensure at least one "other" survives
+    if total > 0:
+        return force
+
+    if original is None:
         return Force(guardians=0, archers=0, mages=0, clerics=0, others=1)
-    return force
+
+    # Pick the bucket with the highest original count.
+    counts = {
+        "guardian": original.guardians,
+        "archer": original.archers,
+        "mage": original.mages,
+        "cleric": original.clerics,
+        "others": original.others,
+    }
+    # Deterministic tie-break priority
+    priority = ["guardian", "archer", "mage", "cleric", "others"]
+    best = max(priority, key=lambda k: (counts.get(k, 0), -priority.index(k)))
+
+    return Force(
+        guardians=1 if best == "guardian" else 0,
+        archers=1 if best == "archer" else 0,
+        mages=1 if best == "mage" else 0,
+        clerics=1 if best == "cleric" else 0,
+        others=1 if best == "others" else 0,
+    )
 
 
 def apply_casualties(force: Force, casualty_rate: float) -> tuple[Force, Force]:
@@ -121,8 +151,8 @@ def apply_casualties(force: Force, casualty_rate: float) -> tuple[Force, Force]:
         others=max(0, force.others - lost.others),
     )
 
-    # Ensure not fully wiped
-    rem = clamp_force_min_one(rem)
+    # Ensure not fully wiped (keep 1 in the most representative bucket)
+    rem = clamp_force_min_one(rem, original=force)
 
     # Recompute lost if we clamped (so totals add up)
     lost = Force(
