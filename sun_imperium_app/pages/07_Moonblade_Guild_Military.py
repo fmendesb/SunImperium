@@ -6,7 +6,7 @@ from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
-from utils.squads import fetch_members, upsert_member
+from utils.squads import detect_member_caps, fetch_members, bulk_add_members
 
 UNDO_CATEGORY = "moonblade"
 
@@ -222,9 +222,10 @@ with tab_squads:
     label = st.selectbox("Select squad", list(squad_options.keys()), key="squad_select")
     squad = squad_options[label]
 
-    # Load members (schema-tolerant)
-    unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
-    members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id)
+    # Load squad members (schema-tolerant)
+    caps = detect_member_caps(sb)
+    UNIT_TYPE_BY_ID = {u.get("id"): (u.get("unit_type") or "Other") for u in units}
+    members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=UNIT_TYPE_BY_ID, _caps=caps)
 
     def compute_squad_power(ms: list[dict]) -> float:
         power_total = 0.0
@@ -291,38 +292,61 @@ with tab_squads:
     if not owned_units:
         st.info("Recruit units first.")
     else:
-        owned_types = sorted({(u.get("unit_type") or "Other").strip() for u in owned_units})
-        cA, cB = st.columns([2, 3])
-        with cA:
-            assign_type = st.selectbox("Unit type", ["All"] + owned_types, key="assign_type")
-        with cB:
-            candidates = [u for u in owned_units if assign_type == "All" or (u.get("unit_type") or "Other").strip() == assign_type]
-            pick = st.selectbox(
-                "Unit",
-                [f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates],
-                key="assign_unit",
-            )
+        st.caption("Tip: enter quantities for multiple units, then click **Add selected** once.")
 
-        chosen = candidates[[f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates].index(pick)]
-        max_add = roster_map.get(chosen["id"], 0)
-        qty_add = st.number_input("Add qty", min_value=1, max_value=max_add, value=1, key="assign_qty")
+        df = pd.DataFrame(
+            [
+                {
+                    "Unit": u.get("name"),
+                    "Type": (u.get("unit_type") or "Other"),
+                    "Owned": int(roster_map.get(u["id"], 0)),
+                    "Power": float(u.get("power") or 0),
+                    "Add": 0,
+                    "_unit_id": u["id"],
+                }
+                for u in owned_units
+            ]
+        )
 
-        if st.button("Add to squad", key="add_to_squad"):
-            # decrement roster
-            sb.table("moonblade_roster").upsert(
-                {"unit_id": chosen["id"], "quantity": max_add - int(qty_add)}
-            ).execute()
+        # show user-facing table only
+        view = df[["Unit", "Type", "Owned", "Power", "Add"]]
+        edited = st.data_editor(
+            view,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Owned": st.column_config.NumberColumn(disabled=True),
+                "Power": st.column_config.NumberColumn(disabled=True),
+                "Add": st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            key="squad_add_editor",
+        )
 
-            # upsert member (schema-tolerant)
-            upsert_member(
-                sb,
-                squad_id=squad["id"],
-                qty_delta=int(qty_add),
-                unit_id=chosen.get("id"),
-                unit_type=(chosen.get("unit_type") or "Other"),
-            )
+        if st.button("Add selected", type="primary"):
+            adds = []
+            for i, row in edited.iterrows():
+                add_qty = int(row.get("Add") or 0)
+                if add_qty <= 0:
+                    continue
+                unit_id = df.iloc[i]["_unit_id"]
+                owned = int(df.iloc[i]["Owned"])
+                if add_qty > owned:
+                    add_qty = owned
+                adds.append(
+                    {
+                        "unit_id": unit_id,
+                        "unit_type": str(df.iloc[i]["Type"]),
+                        "qty": add_qty,
+                    }
+                )
+                # decrement roster
+                sb.table("moonblade_roster").upsert({"unit_id": unit_id, "quantity": owned - add_qty}).execute()
 
-            st.success("Assigned.")
-            st.rerun()
+            if adds:
+                bulk_add_members(sb, squad["id"], adds, caps)
+                st.success("Assigned.")
+                st.rerun()
+            else:
+                st.info("Nothing to add.")
 
 st.info("War Simulator: pick a friendly squad and an enemy squad (DM-created) to resolve battles.")
