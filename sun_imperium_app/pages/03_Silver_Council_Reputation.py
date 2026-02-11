@@ -1,141 +1,75 @@
 import streamlit as st
 import pandas as pd
 
-from utils.nav import sidebar, page_config
+from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
+from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.dm import dm_gate
-from utils.ledger import get_current_week
+from utils import infrastructure_effects
 
-page_config("Silver Council | Reputation", "📜")
-sidebar("📜 Reputation")
+UNDO_CATEGORY = "infrastructure"
+
+page_config("Silver Council | Shop", "🏛️")
+sidebar("🏛 Shop")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
+
 week = get_current_week(sb)
+tot = compute_totals(sb, week=week)
 
-st.title("📜 Reputation")
-st.caption(f"Week {week}")
+st.title("🏛️ Silver Council Shop")
+st.caption(f"Week {week} · Moonvault: {tot.gold:,.0f} gold")
 
-# Filters
-filter_view = st.radio("Show", ["All", "Regions", "Families"], horizontal=True)
+# Load catalog + owned
+catalog = sb.table("infrastructure").select("name,category,cost,tier,description").order("category").order("tier").order("name").execute().data or []
+owned = sb.table("infrastructure_owned").select("name").execute().data or []
+owned_set = {o["name"] for o in owned if o.get("name")}
 
-# Hidden reputations are controlled from DM Console. This page is player-facing.
-show_hidden = False
-
-
-def dc_bonus_from_score(score: int) -> tuple[int, int]:
-    """Monotonic mapping: higher score => lower DC, higher bonus.
-
-    Replace table if you have a canon mapping in your doc.
-    """
-    s = max(0, min(10, int(score)))
-    dc_table = {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10}
-    bonus_table = {0: -3, 1: -2, 2: -1, 3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7}
-    return dc_table[s], bonus_table[s]
-
-
-# Load factions (the list of all reputations)
-try:
-    factions = (
-        sb.table("factions")
-        .select("id,name,type,is_hidden")
-        .order("type")
-        .order("name")
-        .execute()
-        .data
-        or []
-    )
-except Exception:
-    factions = (
-        sb.table("factions")
-        .select("id,name,type")
-        .order("type")
-        .order("name")
-        .execute()
-        .data
-        or []
-    )
-
-if filter_view == "Regions":
-    factions = [f for f in factions if str(f.get("type")) == "region"]
-elif filter_view == "Families":
-    factions = [f for f in factions if str(f.get("type")) in {"family", "house"}]
-
-if not show_hidden:
-    factions = [f for f in factions if not bool(f.get("is_hidden", False))]
-
-# Load current-week reputation rows
-rep_rows = (
-    sb.table("reputation")
-    .select("week,faction_id,score,dc,bonus,note")
-    .eq("week", week)
-    .execute()
-    .data
-    or []
-)
-rep_map = {r["faction_id"]: r for r in rep_rows}
-
-# Build UI dataframe (no IDs shown)
-data = []
-for f in factions:
-    fid = f["id"]
-    r = rep_map.get(fid, {})
-    score = int(r.get("score") or 0)
-    dc, bonus = dc_bonus_from_score(score)
-    data.append(
-        {
-            "Faction": f.get("name"),
-            "Type": f.get("type"),
-            "Score": score,
-            "DC": dc,
-            "Notes": r.get("note") or "",
-            "_faction_id": fid,
-        }
-    )
-
-if not data:
-    st.info("No reputations to display.")
+if not catalog:
+    st.warning("No infrastructure seeded yet.")
     st.stop()
 
-df = pd.DataFrame(data)
+categories = sorted({c.get("category") or "Other" for c in catalog})
+pick_cat = st.selectbox("Category", ["All"] + categories)
 
-edited = st.data_editor(
-    df.drop(columns=["_faction_id"]),
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Faction": st.column_config.TextColumn(disabled=True),
-        "Type": st.column_config.TextColumn(disabled=True),
-        "DC": st.column_config.NumberColumn(disabled=True),
-    },
-    key="rep_editor",
-)
+shown = [c for c in catalog if (pick_cat == "All" or (c.get("category") or "Other") == pick_cat)]
 
-if dm_gate("DM password required to save reputation changes", key="rep_save"):
-    if st.button("💾 Save changes", type="primary"):
-        try:
-            for i, row in edited.iterrows():
-                fid = df.iloc[i]["_faction_id"]
-                score = int(row["Score"])
-                note = str(row.get("Notes") or "").strip()
-                dc, bonus = dc_bonus_from_score(score)
+st.divider()
+st.subheader("Available infrastructure")
 
-                sb.table("reputation").upsert(
-                    {
-                        "week": week,
-                        "faction_id": fid,
-                        "score": score,
-                        "dc": dc,
-                        "bonus": bonus,
-                        "note": note,
-                    },
-                    on_conflict="week,faction_id",
-                ).execute()
+for item in shown:
+    name = item.get("name") or ""
+    cost = float(item.get("cost") or 0)
+    tier = item.get("tier")
+    cat = item.get("category") or "Other"
+    owned_flag = name in owned_set
+    eff = infrastructure_effects.describe_infrastructure_effect(name)
 
-            st.success("Saved.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to save: {e}")
-else:
-    st.info("View-only (DM locked).")
+    with st.container(border=True):
+        top = st.columns([3, 1])
+        with top[0]:
+            st.write(f"**{name}**" + (f" (T{tier})" if tier else ""))
+            st.caption(cat)
+            if item.get("description"):
+                st.write(item["description"])
+            if eff:
+                st.info(eff)
+            if owned_flag:
+                st.success("Owned")
+        with top[1]:
+            st.write(f"Cost: **{cost:,.0f}**")
+            if st.button("Buy", key=f"buy_{name}", disabled=owned_flag or tot.gold < cost):
+                sb.table("infrastructure_owned").insert({"name": name, "week": week}).execute()
+                add_ledger_entry(sb, week=week, direction="out", amount=cost, category="infrastructure_purchase", note=f"Bought {name}")
+                st.success("Purchased.")
+                st.rerun()
+
+st.divider()
+st.subheader("Owned (summary)")
+prod_mult = infrastructure_effects.production_multiplier_owned(sb)
+social_pts = infrastructure_effects.social_points_owned(sb)
+c1, c2 = st.columns(2)
+c1.metric("Production multiplier", f"x{prod_mult:.2f}")
+c2.metric("Social points", f"{social_pts:d}")
