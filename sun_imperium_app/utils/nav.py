@@ -16,6 +16,9 @@ def hide_default_sidebar_nav() -> None:
           div[data-testid="stSidebarNav"] { display: none !important; }
           nav[aria-label="App pages"] { display: none !important; }
           [data-testid="stSidebarNavItems"] { display: none !important; }
+          /* Catch-all for newer testids */
+          [data-testid^="stSidebarNav"] { display: none !important; }
+          [data-testid^="stSidebarNav"] * { display: none !important; }
 
           /* Keep sidebar container + content visible */
           section[data-testid="stSidebar"] { display: block !important; visibility: visible !important; }
@@ -56,6 +59,7 @@ def sidebar(active: str | None = None) -> None:
         ("⚔ Military", "pages/07_Moonblade_Guild_Military.py"),
         ("🩸 War Simulator", "pages/08_War_Simulator.py"),
         ("🛠 Crafting Hub", "pages/09_Crafting_Hub.py"),
+        ("📊 Economy", "pages/10_Economy.py"),
         ("🧿 DM Console", "pages/99_DM_Console.py"),
     ]
 
