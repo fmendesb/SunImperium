@@ -1,328 +1,321 @@
 import streamlit as st
-import pandas as pd
 
 from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
-from utils.ledger import get_current_week, compute_totals, add_ledger_entry
-from utils.undo import log_action, get_last_action, pop_last_action
-from utils.squads import fetch_members, upsert_member
+from utils.ledger import get_current_week
+from utils.dm import dm_gate
+from utils.undo import log_action
+from utils.war import Force, simulate_battle
+from utils.squads import fetch_members
 
-UNDO_CATEGORY = "moonblade"
 
-page_config("Moonblade Guild | Military", "⚔️")
-sidebar("⚔ Military")
+def rows_to_force(rows: list[dict]) -> Force:
+    """Convert squad_members rows into a Force.
+
+    We normalize unit_type strings so older/looser data doesn't break the sim.
+    """
+    buckets = {"guardian": 0, "archer": 0, "mage": 0, "cleric": 0, "others": 0}
+    for r in rows or []:
+        t = (r.get("unit_type") or "").strip().lower()
+        q = int(r.get("quantity") or 0)
+        if q <= 0:
+            continue
+        if t.startswith("guard"):
+            buckets["guardian"] += q
+        elif t.startswith("arch"):
+            buckets["archer"] += q
+        elif t.startswith("mage"):
+            buckets["mage"] += q
+        elif t.startswith("cler"):
+            buckets["cleric"] += q
+        else:
+            buckets["others"] += q
+    return Force(
+        guardians=buckets["guardian"],
+        archers=buckets["archer"],
+        mages=buckets["mage"],
+        clerics=buckets["cleric"],
+        others=buckets["others"],
+    )
+
+UNDO_CATEGORY = "war"
+
+page_config("War Simulator", "🩸")
+sidebar("🩸 War Simulator")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
 week = get_current_week(sb)
 
-tot = compute_totals(sb, week=week)
+# Cache unit catalog so we can infer unit_type when squad_members only stores unit_id
+try:
+    _units = sb.table("moonblade_units").select("id,unit_type").execute().data or []
+except Exception:
+    _units = []
+UNIT_TYPE_BY_ID = {u.get("id"): (u.get("unit_type") or "Other") for u in _units}
 
-st.title("⚔️ Moonblade Guild")
-st.caption(f"Military · Week {week} · Moonvault: {tot.gold:,.0f} gold")
 
-# -------------------------
-# Undo
-# -------------------------
-with st.popover("↩️ Undo (Moonblade)"):
-    last = get_last_action(sb, category=UNDO_CATEGORY)
-    if not last:
-        st.write("No actions to undo.")
-    else:
-        payload = last.get("payload") or {}
-        st.write(f"Last: {last.get('action','')} · {payload.get('name','')}")
-        if st.button("Undo last", key="undo_moonblade"):
-            if last.get("action") == "recruit_unit":
-                unit_id = payload.get("unit_id")
-                qty = int(payload.get("qty") or 0)
-                refund = float(payload.get("cost") or 0)
+def fetch_squad_member_rows(squad_id) -> list[dict]:
+    """Fetch squad members across schema variants.
 
-                if unit_id and qty:
-                    roster = (
-                        sb.table("moonblade_roster")
-                        .select("quantity")
-                        .eq("unit_id", unit_id)
-                        .limit(1)
-                        .execute()
-                        .data
-                    )
-                    if roster:
-                        new_qty = max(0, int(roster[0]["quantity"]) - qty)
-                        sb.table("moonblade_roster").upsert({"unit_id": unit_id, "quantity": new_qty}).execute()
+    Normalizes rows so the simulator can always read `unit_type` and `quantity`.
+    """
+    rows, _caps = fetch_members(sb, squad_id, unit_type_by_id=UNIT_TYPE_BY_ID)
+    return rows
 
-                if refund:
-                    add_ledger_entry(
-                        sb,
-                        week=week,
-                        direction="in",
-                        amount=refund,
-                        category="undo_refund",
-                        note="Undo: recruit unit",
-                    )
 
-                pop_last_action(sb, action_id=last["id"])
-                st.success("Undone.")
-                st.rerun()
-            else:
-                st.error("Undo not implemented for this action type yet.")
+def rows_agg_for_display(rows: list[dict]) -> list[dict]:
+    """Reduce detailed unit rows into unit_type buckets for the sim."""
+    out: list[dict] = []
+    for r in rows or []:
+        out.append({"unit_type": r.get("unit_type"), "quantity": r.get("quantity")})
+    return out
 
-st.divider()
-
-# -------------------------
-# Load units + roster once
-# -------------------------
-units = (
-    sb.table("moonblade_units")
-    .select("id,name,unit_type,power,cost,upkeep,description")
-    .order("unit_type")
-    .order("name")
-    .execute()
-    .data
-    or []
+st.title("🩸 War Simulator")
+st.caption(
+    "Pick a friendly squad and (optionally) an enemy squad created by the DM. "
+    "Resolve a battle, then apply casualties (DM-only)."
 )
 
-roster_rows = sb.table("moonblade_roster").select("unit_id,quantity").execute().data or []
-roster_map = {r["unit_id"]: int(r.get("quantity") or 0) for r in roster_rows}
-unit_by_id = {u["id"]: u for u in units}
-
 # -------------------------
-# Tabs
+# Load squads
 # -------------------------
-tab_units, tab_squads = st.tabs(["🛡️ Units", "👥 Squads"])
+try:
+    squads = (
+        sb.table("squads")
+        .select("id,name,region,is_enemy")
+        .order("is_enemy", desc=False)
+        .order("name")
+        .execute()
+        .data
+        or []
+    )
+except Exception:
+    # Backward compatibility: squads table without is_enemy
+    squads = sb.table("squads").select("id,name,region").order("name").execute().data or []
+    for s in squads:
+        s["is_enemy"] = False
 
-# =========================
-# Units
-# =========================
-with tab_units:
-    st.subheader("Recruitment")
+friendly_squads = [s for s in squads if not bool(s.get("is_enemy"))]
+enemy_squads = [s for s in squads if bool(s.get("is_enemy"))]
 
-    if not units:
-        st.warning("No Moonblade units seeded yet. Seed `moonblade_units` from Excel.")
-    else:
-        unit_types = sorted({(u.get("unit_type") or "Other").strip() for u in units})
-        filt_cols = st.columns([2, 3, 2])
-        with filt_cols[0]:
-            type_filter = st.selectbox("Filter by unit type", ["All"] + unit_types, key="unit_type_filter")
-        with filt_cols[1]:
-            text_filter = st.text_input("Search", value="", placeholder="Type a name...", key="unit_search")
-        with filt_cols[2]:
-            owned_only = st.checkbox("Show owned only", value=False)
+if not friendly_squads:
+    st.warning("No friendly squads found. Create squads in Moonblade Guild → Military.")
+    st.stop()
 
-        def _match(u: dict) -> bool:
-            if type_filter != "All" and (u.get("unit_type") or "Other").strip() != type_filter:
-                return False
-            if owned_only and roster_map.get(u["id"], 0) <= 0:
-                return False
-            if text_filter.strip():
-                return text_filter.strip().lower() in (u.get("name") or "").lower()
-            return True
+squad_choice = st.selectbox(
+    "Friendly squad",
+    options=friendly_squads,
+    format_func=lambda r: f"{r.get('name')}" + (f" · {r.get('region')}" if r.get("region") else ""),
+)
 
-        shown = [u for u in units if _match(u)]
-        if not shown:
-            st.info("No units match your filters.")
-        else:
-            for u in shown:
-                with st.container(border=True):
-                    left, right = st.columns([3, 1])
-                    with left:
-                        st.write(f"**{u['name']}**")
-                        st.caption(u.get("description") or "")
-                        st.write(
-                            f"Type: {(u.get('unit_type') or 'Other')} · "
-                            f"Cost: {float(u.get('cost') or 0):,.0f} · "
-                            f"Upkeep: {float(u.get('upkeep') or 0):,.0f} · "
-                            f"Power: {float(u.get('power') or 0):,.0f}"
-                        )
-                        st.write(f"Owned: {roster_map.get(u['id'], 0)}")
+ally_rows = fetch_squad_member_rows(squad_choice["id"])
+ally = rows_to_force(rows_agg_for_display(ally_rows))
 
-                    with right:
-                        qty = st.number_input(
-                            "Qty",
-                            min_value=1,
-                            max_value=999,
-                            value=1,
-                            key=f"qty_{u['id']}",
-                        )
-                        total_cost = float(u.get("cost") or 0) * int(qty)
-                        if st.button("Recruit", key=f"recruit_{u['id']}", disabled=tot.gold < total_cost):
-                            new_qty = roster_map.get(u["id"], 0) + int(qty)
-                            sb.table("moonblade_roster").upsert({"unit_id": u["id"], "quantity": new_qty}).execute()
+st.subheader("Friendly force")
+colA, colB, colC, colD, colE = st.columns(5)
+colA.metric("Guardians", ally.guardians)
+colB.metric("Archers", ally.archers)
+colC.metric("Mages", ally.mages)
+colD.metric("Clerics", ally.clerics)
+colE.metric("Others", ally.others)
 
-                            add_ledger_entry(
-                                sb,
-                                week=week,
-                                direction="out",
-                                amount=total_cost,
-                                category="moonblade_recruit",
-                                note=f"Recruited {qty}x {u['name']}",
-                                metadata={"unit_id": u["id"], "qty": int(qty)},
-                            )
-                            log_action(
-                                sb,
-                                category=UNDO_CATEGORY,
-                                action="recruit_unit",
-                                payload={"unit_id": u["id"], "qty": int(qty), "cost": total_cost, "name": u["name"]},
-                            )
-                            st.success("Recruited.")
-                            st.rerun()
+st.divider()
+st.subheader("Enemy force")
 
-# =========================
-# Squads
-# =========================
-with tab_squads:
-    st.subheader("Squads")
-    st.caption("Create squads and assign owned units. Squad power is computed from unit power × quantity.")
+use_enemy_squad = st.toggle(
+    "Use a DM enemy squad",
+    value=bool(enemy_squads),
+    help="If you have enemy squads created in DM Console, you can pick one here.",
+)
 
-    # Friendly squads only
-    try:
-        squads = (
-            sb.table("squads")
-            .select("id,name,region,destination,mission,status,deployed_week,is_enemy")
-            .eq("is_enemy", False)
-            .order("name")
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        squads = sb.table("squads").select("id,name,region").order("name").execute().data or []
+enemy_squad_choice = None
+if use_enemy_squad and enemy_squads:
+    enemy_squad_choice = st.selectbox(
+        "Enemy squad",
+        options=enemy_squads,
+        format_func=lambda r: f"{r.get('name')}" + (f" · {r.get('region')}" if r.get("region") else ""),
+    )
+    enemy_rows = fetch_squad_member_rows(enemy_squad_choice["id"])
+    enemy = rows_to_force(rows_agg_for_display(enemy_rows))
 
-    with st.form("create_squad", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            squad_name = st.text_input("New squad name")
-        with c2:
-            region = st.text_input("Home region (optional)", placeholder="New Triport")
-        with c3:
-            destination = st.text_input("Deployed to (optional)", placeholder="Amnesty")
-        mission = st.text_input("Mission (optional)", placeholder="Patrol / Escort / Siege...")
-        if st.form_submit_button("Create squad"):
-            if squad_name.strip():
-                payload = {"name": squad_name.strip(), "region": region.strip() or None}
-                # optional newer fields
-                payload["destination"] = destination.strip() or None
-                payload["mission"] = mission.strip() or None
-                payload["status"] = "ready"
-                payload["deployed_week"] = None
-                payload["is_enemy"] = False
-                try:
-                    sb.table("squads").insert(payload).execute()
-                except Exception:
-                    # fallback: only the old columns exist
-                    sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip() or None}).execute()
-                st.success("Squad created.")
-                st.rerun()
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Guardians", enemy.guardians)
+    c2.metric("Archers", enemy.archers)
+    c3.metric("Mages", enemy.mages)
+    c4.metric("Clerics", enemy.clerics)
+    c5.metric("Others", enemy.others)
+else:
+    st.caption("Manual input")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        e_guardians = st.number_input("Enemy Guardians", min_value=0, value=0, step=1)
+    with c2:
+        e_archers = st.number_input("Enemy Archers", min_value=0, value=0, step=1)
+    with c3:
+        e_mages = st.number_input("Enemy Mages", min_value=0, value=0, step=1)
+    with c4:
+        e_clerics = st.number_input("Enemy Clerics", min_value=0, value=0, step=1)
+    with c5:
+        e_others = st.number_input("Enemy Others", min_value=0, value=0, step=1)
 
-    if not squads:
-        st.info("No squads yet. Create one above.")
-        st.stop()
-
-    squad_options = {s["name"]: s for s in squads}
-    label = st.selectbox("Select squad", list(squad_options.keys()), key="squad_select")
-    squad = squad_options[label]
-
-    # Load members (schema-tolerant)
-    unit_type_by_id = {u["id"]: (u.get("unit_type") or "Other") for u in units}
-    members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=unit_type_by_id)
-
-    def compute_squad_power(ms: list[dict]) -> float:
-        power_total = 0.0
-        for m in ms:
-            qty = int(m.get("quantity") or 0)
-            uid = m.get("unit_id")
-            if uid and uid in unit_by_id:
-                p = float(unit_by_id[uid].get("power") or 0)
-            else:
-                # fallback: unknown unit_id, approximate
-                p = 1.0
-            power_total += p * qty
-        return power_total
-
-    st.markdown(
-        f"**{squad.get('name')}** · Region: {squad.get('region') or '—'} · "
-        f"Power: **{compute_squad_power(members):,.1f}**"
+    enemy = Force(
+        guardians=int(e_guardians),
+        archers=int(e_archers),
+        mages=int(e_mages),
+        clerics=int(e_clerics),
+        others=int(e_others),
     )
 
-    # Mission / status editor
-    with st.expander("📌 Deployment / Mission", expanded=False):
-        cur_dest = (squad.get("destination") or "")
-        cur_mis = (squad.get("mission") or "")
-        cur_status = (squad.get("status") or "ready")
+if st.button("Resolve battle", type="primary"):
+    st.session_state["war_result"] = simulate_battle(ally, enemy)
 
-        dest = st.text_input("Deployed to", value=cur_dest, key="sq_dest")
-        mis = st.text_input("Mission", value=cur_mis, key="sq_mis")
-        status = st.selectbox("Status", ["ready", "deployed", "resting", "wounded"], index=["ready", "deployed", "resting", "wounded"].index(cur_status) if cur_status in ["ready", "deployed", "resting", "wounded"] else 0)
+result = st.session_state.get("war_result")
+if not result:
+    st.stop()
 
-        if st.button("Save deployment", key="save_deploy"):
-            try:
-                sb.table("squads").update({
-                    "destination": dest.strip() or None,
-                    "mission": mis.strip() or None,
-                    "status": status,
-                    "deployed_week": week if status == "deployed" else None,
-                }).eq("id", squad["id"]).execute()
-                st.success("Saved.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not save (missing columns?): {e}")
+st.divider()
+st.subheader("Outcome")
+st.write(f"**Winner:** {result.winner.upper()}")
+st.caption(f"Power: Ally {result.ally_power:,.1f} · Enemy {result.enemy_power:,.1f}")
 
-    # Members table
-    if members:
-        mrows = []
-        for m in members:
-            uid = m.get("unit_id")
-            u = unit_by_id.get(uid) if uid else None
-            name = (u.get("name") if u else None) or (m.get("unit_type") or "Unknown")
-            mrows.append(
-                {
-                    "Unit": name,
-                    "Type": (u.get("unit_type") if u else m.get("unit_type") or "Other"),
-                    "Qty": int(m.get("quantity") or 0),
-                }
-            )
-        st.dataframe(pd.DataFrame(mrows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No members assigned yet.")
+r1, r2 = st.columns(2)
+with r1:
+    st.markdown("### Ally")
+    st.write("Casualties:")
+    st.json(result.ally_casualties.as_dict())
+    st.write("Remaining:")
+    st.json(result.ally_remaining.as_dict())
+with r2:
+    st.markdown("### Enemy")
+    st.write("Casualties:")
+    st.json(result.enemy_casualties.as_dict())
+    st.write("Remaining:")
+    st.json(result.enemy_remaining.as_dict())
 
-    st.markdown("#### Assign units")
+st.info(
+    "Rules: guardians > archers > mages > guardians. Clerics buff allies. "
+    "No side is ever wiped to zero survivors (sim clamps at least 1 remaining)."
+)
 
-    owned_units = [u for u in units if roster_map.get(u["id"], 0) > 0]
-    if not owned_units:
-        st.info("Recruit units first.")
-    else:
-        owned_types = sorted({(u.get("unit_type") or "Other").strip() for u in owned_units})
-        cA, cB = st.columns([2, 3])
-        with cA:
-            assign_type = st.selectbox("Unit type", ["All"] + owned_types, key="assign_type")
-        with cB:
-            candidates = [u for u in owned_units if assign_type == "All" or (u.get("unit_type") or "Other").strip() == assign_type]
-            pick = st.selectbox(
-                "Unit",
-                [f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates],
-                key="assign_unit",
-            )
+# -------------------------
+# Apply results
+# -------------------------
+st.divider()
+st.subheader("Apply casualties (DM)")
 
-        chosen = candidates[[f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates].index(pick)]
-        max_add = roster_map.get(chosen["id"], 0)
-        qty_add = st.number_input("Add qty", min_value=1, max_value=max_add, value=1, key="assign_qty")
+if not dm_gate("Apply battle results", key="war_apply"):
+    st.warning("Locked. Use DM password to apply changes.")
+    st.stop()
 
-        if st.button("Add to squad", key="add_to_squad"):
-            # decrement roster
-            sb.table("moonblade_roster").upsert(
-                {"unit_id": chosen["id"], "quantity": max_add - int(qty_add)}
-            ).execute()
+apply_enemy = bool(enemy_squad_choice)
 
-            # upsert member (schema-tolerant)
-            upsert_member(
-                sb,
-                squad_id=squad["id"],
-                qty_delta=int(qty_add),
-                unit_id=chosen.get("id"),
-                unit_type=(chosen.get("unit_type") or "Other"),
-            )
+st.caption("Applies remaining counts to squad(s). If an enemy squad is selected, it will be updated too.")
 
-            st.success("Assigned.")
-            st.rerun()
+if st.button("Apply to squads", type="secondary"):
+    def apply_remaining_to_rows(squad_id, rows: list[dict], remaining_by_type: dict):
+        """Apply remaining counts to detailed (unit_id-based) squad rows.
 
-st.info("War Simulator: pick a friendly squad and an enemy squad (DM-created) to resolve battles.")
+        We reduce each unit_type bucket proportionally across the underlying unit rows.
+        This avoids requiring a unit_type-only schema and keeps recruitment-by-unit intact.
+        """
+        # Group current rows by unit_type
+        by_type: dict[str, list[dict]] = {}
+        for r in rows:
+            t = (r.get("unit_type") or "Other")
+            by_type.setdefault(t, []).append(r)
+
+        for t, rlist in by_type.items():
+            cur_total = sum(int(x.get("quantity") or 0) for x in rlist)
+            target = int(remaining_by_type.get(t, 0))
+            if cur_total <= 0:
+                continue
+            if target < 0:
+                target = 0
+
+            # Scale quantities
+            ratio = target / cur_total
+            new_q = []
+            for x in rlist:
+                q = int(x.get("quantity") or 0)
+                nq = int(q * ratio)
+                new_q.append(nq)
+
+            # Distribute leftover to reach exact target (deterministic order)
+            leftover = target - sum(new_q)
+            if leftover > 0:
+                # Give +1 to the first N rows
+                for i in range(min(leftover, len(new_q))):
+                    new_q[i] += 1
+            elif leftover < 0:
+                # Remove 1 from rows that still have >0
+                to_remove = -leftover
+                for i in range(len(new_q)):
+                    if to_remove <= 0:
+                        break
+                    if new_q[i] > 0:
+                        new_q[i] -= 1
+                        to_remove -= 1
+
+            # Persist (schema-tolerant: some squad_members tables have no `id` column)
+            for x, nq in zip(rlist, new_q):
+                # Prefer (squad_id, unit_id) if present
+                if x.get("unit_id") is not None:
+                    sb.table("squad_members").update({"quantity": int(nq)}).eq("squad_id", squad_id).eq("unit_id", x["unit_id"]).execute()
+                else:
+                    # Fallback (squad_id, unit_type)
+                    ut = (x.get("unit_type") or "Other")
+                    sb.table("squad_members").update({"quantity": int(nq)}).eq("squad_id", squad_id).eq("unit_type", ut).execute()
+
+    # Friendly squad update
+    remaining_ally = result.ally_remaining.as_dict()
+    apply_remaining_to_rows(squad_choice["id"], ally_rows, remaining_ally)
+
+    # Enemy squad update (if used)
+    if apply_enemy and enemy_squad_choice is not None:
+        remaining_enemy = result.enemy_remaining.as_dict()
+        apply_remaining_to_rows(enemy_squad_choice["id"], enemy_rows, remaining_enemy)
+
+    # War log (best-effort across schema variants)
+    war_row = {
+        "week": week,
+        "squad_id": squad_choice["id"],
+        "enemy": enemy.as_dict(),
+        "result": {
+            "winner": result.winner,
+            "ally_power": result.ally_power,
+            "enemy_power": result.enemy_power,
+            "ally_casualties": result.ally_casualties.as_dict(),
+            "enemy_casualties": result.enemy_casualties.as_dict(),
+            "ally_remaining": result.ally_remaining.as_dict(),
+            "enemy_remaining": result.enemy_remaining.as_dict(),
+            "enemy_squad_id": enemy_squad_choice["id"] if enemy_squad_choice else None,
+        },
+    }
+    try:
+        sb.table("wars").insert(war_row).execute()
+    except Exception:
+        # older schema used enemy_force
+        try:
+            war_row2 = dict(war_row)
+            war_row2["enemy_force"] = war_row2.pop("enemy")
+            sb.table("wars").insert(war_row2).execute()
+        except Exception:
+            pass
+
+    log_action(
+        sb,
+        category=UNDO_CATEGORY,
+        action="apply_war",
+        payload={
+            "week": week,
+            "friendly_squad_id": squad_choice["id"],
+            "enemy_squad_id": enemy_squad_choice["id"] if enemy_squad_choice else None,
+            "before_friendly": ally.as_dict(),
+            "after_friendly": remaining_ally,
+        },
+    )
+
+    st.success("Applied.")
+    st.rerun()
