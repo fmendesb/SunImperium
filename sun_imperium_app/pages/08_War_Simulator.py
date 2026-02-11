@@ -10,6 +10,23 @@ from utils.war import Force, simulate_battle
 from utils.squads import detect_member_caps, fetch_members, upsert_member_quantity
 
 
+def bucket_key(unit_type_raw: str) -> str:
+    """Normalize unit_type strings into sim buckets.
+
+    Accepts pluralization/casing and common prefixes. Unknown types become "others".
+    """
+    t = (unit_type_raw or "").strip().lower()
+    if t.startswith("guard"):
+        return "guardian"
+    if t.startswith("arch"):
+        return "archer"
+    if t.startswith("mage"):
+        return "mage"
+    if t.startswith("cler"):
+        return "cleric"
+    return "others"
+
+
 def force_to_dict(f: Force) -> dict:
     return {
         "guardian": int(f.guardians),
@@ -27,20 +44,11 @@ def rows_to_force(rows: list[dict]) -> Force:
     """
     buckets = {"guardian": 0, "archer": 0, "mage": 0, "cleric": 0, "others": 0}
     for r in rows or []:
-        t = (r.get("unit_type") or "").strip().lower()
+        t = r.get("unit_type")
         q = int(r.get("quantity") or 0)
         if q <= 0:
             continue
-        if t.startswith("guard"):
-            buckets["guardian"] += q
-        elif t.startswith("arch"):
-            buckets["archer"] += q
-        elif t.startswith("mage"):
-            buckets["mage"] += q
-        elif t.startswith("cler"):
-            buckets["cleric"] += q
-        else:
-            buckets["others"] += q
+        buckets[bucket_key(t)] += q
     return Force(
         guardians=buckets["guardian"],
         archers=buckets["archer"],
@@ -263,21 +271,21 @@ apply_enemy = bool(enemy_squad_choice)
 st.caption("Applies remaining counts to squad(s). If an enemy squad is selected, it will be updated too.")
 
 if st.button("Apply to squads", type="secondary"):
-    def apply_remaining_to_rows(squad_id, rows: list[dict], remaining_by_type: dict, caps):
+    def apply_remaining_to_rows(squad_id, rows: list[dict], remaining_by_bucket: dict, caps):
         """Apply remaining counts to detailed (unit_id-based) squad rows.
 
         We reduce each unit_type bucket proportionally across the underlying unit rows.
         This avoids requiring a unit_type-only schema and keeps recruitment-by-unit intact.
         """
-        # Group current rows by unit_type
-        by_type: dict[str, list[dict]] = {}
+        # Group current rows by sim bucket (guardian/archer/mage/cleric/others)
+        by_bucket: dict[str, list[dict]] = {}
         for r in rows:
-            t = (r.get("unit_type") or "Other")
-            by_type.setdefault(t, []).append(r)
+            b = bucket_key(r.get("unit_type") or "")
+            by_bucket.setdefault(b, []).append(r)
 
-        for t, rlist in by_type.items():
+        for b, rlist in by_bucket.items():
             cur_total = sum(int(x.get("quantity") or 0) for x in rlist)
-            target = int(remaining_by_type.get(t, 0))
+            target = int(remaining_by_bucket.get(b, 0))
             if cur_total <= 0:
                 continue
             if target < 0:
