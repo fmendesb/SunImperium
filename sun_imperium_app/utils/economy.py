@@ -1,10 +1,9 @@
 import hashlib
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
 
-from utils.infrastructure_effects import production_multiplier as infra_production_multiplier
-from utils.infrastructure_effects import social_points as infra_social_points
+from utils import infrastructure_effects
+from typing import Any, Dict, List, Tuple
 
 # --- Canonical Week-1 constants (from DM) ---
 GRAIN_PER_CAPITA = 0.006  # 2700 / 450_000
@@ -335,25 +334,14 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
     avg_prod = _avg_region_production(sb, week)
     avg_rep = _avg_family_reputation(sb, week)
 
-    # Global infrastructure modifiers
-    # - Resource infrastructure boosts production throughput (more goods move even in war)
-    # - Social infrastructure slightly improves resilience (confidence/organization)
-    prod_mult = 1.0
-    social_pts = 0
-    try:
-        prod_mult = float(infra_production_multiplier(sb) or 1.0)
-    except Exception:
-        prod_mult = 1.0
-    try:
-        social_pts = int(infra_social_points(sb) or 0)
-    except Exception:
-        social_pts = 0
+    # Infrastructure and social investments
+    prod_mult = infrastructure_effects.production_multiplier_owned(sb)
+    social_pts = infrastructure_effects.social_points_owned(sb)
+    social_factor = _clamp(1.0 + 0.01 * social_pts, 0.75, 1.35)
+    prod_factor = _clamp(prod_mult, 0.50, 1.75)
 
-    recovery_factor = _clamp(0.35 + 0.06 * avg_prod + 0.04 * avg_rep, 0.15, 1.75)
-    recovery_factor *= _clamp(prod_mult, 0.75, 6.0)
-    # Social points are a small, gentle global boost
-    recovery_factor *= _clamp(1.0 + 0.03 * float(social_pts), 0.85, 1.35)
-    recovery_factor = _clamp(recovery_factor, 0.10, 6.0)
+    recovery_factor = _clamp(0.35 + 0.06 * avg_prod + 0.04 * avg_rep, 0.15, 1.75) * social_factor * prod_factor
+(0.35 + 0.06 * avg_prod + 0.04 * avg_rep, 0.15, 1.75)
 
     war = settings["war_severity"]
     # scarcity: high at war, decreases with recovery
@@ -446,10 +434,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
 
     # Base demand: population-driven spending capacity
     spend_per_capita = float(settings["spend_per_capita"])
-    # Social points modestly increase demand capacity (gentle).
-    social_factor = _clamp(1.0 + 0.05 * float(social_pts), 0.75, 1.75)
-
-    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability * social_factor
+    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
 
     # Additional global scale (kept for DM control)
     demand_budget *= float(settings["economy_scale"])
@@ -477,7 +462,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
             )
 
             # Recompute budget with calibrated spend
-    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
+            demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
             demand_budget *= float(settings["economy_scale"])
             demand_budget *= _stable_rand(week, "TOTAL_DEMAND", rand_min, rand_max)
 
@@ -650,3 +635,50 @@ def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[
                 "player_payout": summary.player_payout,
             }
         ).execute()
+
+
+def estimate_baseline_player_payout(sb, week: int, population: int | None = None) -> float:
+    """Baseline = peace (no war), neutral region/family state, and ALL infrastructure owned.
+
+    Used only for dashboard % comparisons. Does not write anything to DB.
+    """
+    settings = get_settings(sb)
+    rates = rarity_rates(sb)
+    pop = population or get_population(sb, week)
+
+    # Neutral pressures
+    avg_prod = 0.0
+    avg_rep = 0.0
+    recovery_factor = _clamp(0.35 + 0.06 * avg_prod + 0.04 * avg_rep, 0.15, 1.75)
+
+    # All infra baseline
+    prod_mult = infrastructure_effects.production_multiplier_all(sb)
+    social_pts = infrastructure_effects.social_points_all(sb)
+    social_factor = _clamp(1.0 + 0.01 * social_pts, 0.75, 1.35)
+    prod_factor = _clamp(prod_mult, 0.50, 1.75)
+    recovery_factor *= social_factor * prod_factor
+
+    war = 0.0
+    rand_min, rand_max = settings["rand_min"], settings["rand_max"]
+
+    items = (
+        sb.table("gathering_items")
+        .select("name,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family")
+        .execute()
+        .data
+        or []
+    )
+
+    current_index = _price_index(items)
+    baseline_index = max(0.0001, float(settings["baseline_price_index"]))
+    elasticity = float(settings["price_elasticity"])
+    affordability = (baseline_index / current_index) ** elasticity
+    affordability = _clamp(affordability, 0.15, 6.0)
+
+    war_volume = 1.0  # peace
+    spend_per_capita = float(settings["spend_per_capita"])
+    demand_budget = pop * spend_per_capita * war_volume * recovery_factor * affordability
+    demand_budget *= float(settings["economy_scale"])
+    demand_budget *= _stable_rand(week, "TOTAL_DEMAND", rand_min, rand_max)
+
+    return float(demand_budget) * float(settings["tax_rate"]) * float(settings["player_share"])
