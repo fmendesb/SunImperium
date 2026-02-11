@@ -131,28 +131,22 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
 
 
 def production_multiplier(sb: Client) -> float:
-    """Total production multiplier from owned *Resources* infrastructure.
-
-    Effects stack multiplicatively.
-    """
+    """Global production multiplier from owned resource infrastructure."""
     owned_names = get_owned_infrastructure_names(sb)
     mult = 1.0
     for name in owned_names:
         eff = effect_for_infrastructure(name)
         if eff and eff.kind == "multiplier" and eff.target == "production":
-            try:
-                mult *= float(eff.value)
-            except Exception:
-                pass
+            mult *= float(eff.value)
     return float(mult)
 
 
-def social_points(sb: Client) -> float:
+def social_points(sb: Client) -> int:
     """Total social points from owned social infrastructure."""
     owned_names = get_owned_infrastructure_names(sb)
-    pts = 0.0
+    pts = 0
     for name in owned_names:
         eff = effect_for_infrastructure(name)
         if eff and eff.kind == "social_bonus" and eff.target == "social":
-            pts += float(eff.value)
-    return float(pts)
+            pts += int(eff.value)
+    return int(pts)
