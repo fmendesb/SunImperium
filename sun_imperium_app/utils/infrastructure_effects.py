@@ -130,39 +130,29 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
     return bonus
 
 
-def production_multiplier_total(sb: Client) -> float:
-    """Combined production multiplier from owned 'Resources' infrastructure."""
+def production_multiplier(sb: Client) -> float:
+    """Total production multiplier from owned *Resources* infrastructure.
+
+    Effects stack multiplicatively.
+    """
     owned_names = get_owned_infrastructure_names(sb)
     mult = 1.0
     for name in owned_names:
         eff = effect_for_infrastructure(name)
         if eff and eff.kind == "multiplier" and eff.target == "production":
-            mult *= float(eff.value)
-    return mult
+            try:
+                mult *= float(eff.value)
+            except Exception:
+                pass
+    return float(mult)
 
 
-def social_bonus_total(sb: Client) -> float:
-    """Total social bonus points from owned 'Social' infrastructure."""
+def social_points(sb: Client) -> float:
+    """Total social points from owned social infrastructure."""
     owned_names = get_owned_infrastructure_names(sb)
     pts = 0.0
     for name in owned_names:
         eff = effect_for_infrastructure(name)
         if eff and eff.kind == "social_bonus" and eff.target == "social":
             pts += float(eff.value)
-    return pts
-
-
-def describe_infrastructure_effect(name: str) -> str:
-    """Human-friendly one-liner for the shop UI."""
-    eff = effect_for_infrastructure(name)
-    if not eff:
-        return ""
-    if eff.kind == "power_bonus":
-        return f"+{int(eff.value)} {eff.target.title()} Power"
-    if eff.kind == "success_bonus_pct":
-        return f"+{int(eff.value)}% {eff.target.title()} Success Chance"
-    if eff.kind == "multiplier":
-        return f"x{eff.value:g} Production"
-    if eff.kind == "social_bonus":
-        return f"+{int(eff.value)} Social (satisfaction)"
-    return f"{eff.value}{eff.unit}"
+    return float(pts)
