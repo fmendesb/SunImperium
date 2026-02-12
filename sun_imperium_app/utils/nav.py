@@ -56,6 +56,7 @@ def sidebar(active: str | None = None) -> None:
         ("⚔ Military", "pages/07_Moonblade_Guild_Military.py"),
         ("🩸 War Simulator", "pages/08_War_Simulator.py"),
         ("🛠 Crafting Hub", "pages/09_Crafting_Hub.py"),
+        ("📊 Economy", "pages/10_Economy.py")
         ("🧿 DM Console", "pages/99_DM_Console.py"),
     ]
 
