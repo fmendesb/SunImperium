@@ -131,33 +131,28 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
 
 
 def describe_infrastructure_effect(name: str) -> str:
-    """Human-readable description of what an infrastructure purchase does.
-
-    Used by the Shop page so players see clear +1/+2/+3, % bonuses, multipliers,
-    and social points.
-    """
-    name = (name or "").strip()
+    """Return a short, readable effect string for UI display."""
     eff = effect_for_infrastructure(name)
-    prereq = prereq_name_for_infrastructure(name)
-
-    bits: list[str] = []
-    if prereq:
-        bits.append(f"Prerequisite: {prereq}.")
-
     if not eff:
-        return " ".join(bits) if bits else ""
+        return ""
+
+    # Friendly target naming
+    tgt = eff.target
+    if tgt in {"guardian", "archer", "mage", "cleric"}:
+        tgt_label = tgt.title() + "s"
+    elif tgt == "production":
+        tgt_label = "Production"
+    elif tgt == "social":
+        tgt_label = "Social"
+    else:
+        tgt_label = tgt.title()
 
     if eff.kind == "power_bonus":
-        bits.append(f"+{int(eff.value)} power to {eff.target.title()} units.")
-    elif eff.kind == "success_bonus_pct":
-        bits.append(f"+{int(eff.value)}% {eff.target.title()} mission success chance.")
-    elif eff.kind == "multiplier":
-        bits.append(f"{eff.value:.2f}x production multiplier.")
-    elif eff.kind == "social_bonus":
-        bits.append(f"+{int(eff.value)} social points (improves stability/economy).")
-    else:
-        # generic fallback
-        unit = eff.unit or ""
-        bits.append(f"{eff.target}: {eff.value}{unit}.")
-
-    return " ".join(bits)
+        return f"{tgt_label}: +{int(eff.value)} power"
+    if eff.kind == "success_bonus_pct":
+        return f"{tgt_label}: +{int(eff.value)}% success"
+    if eff.kind == "multiplier":
+        return f"{tgt_label}: x{eff.value:g} output"
+    if eff.kind == "social_bonus":
+        return f"{tgt_label}: +{int(eff.value)} social points"
+    return ""
