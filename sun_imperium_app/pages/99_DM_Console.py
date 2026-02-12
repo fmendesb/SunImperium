@@ -176,9 +176,20 @@ with reps_tab:
 
         if st.button("Save reputation visibility", type="primary"):
             try:
+                hidden_list: list[str] = []
                 for i, row in edited_f.iterrows():
                     fid = df_f.iloc[i]["_id"]
-                    sb.table("factions").update({"is_hidden": bool(row["Hidden from players"]) }).eq("id", fid).execute()
+                    is_hidden = bool(row["Hidden from players"])
+                    sb.table("factions").update({"is_hidden": is_hidden }).eq("id", fid).execute()
+                    if is_hidden:
+                        hidden_list.append(str(fid))
+
+                # Backward compatible: some pages read hidden faction ids from app_state
+                # (array column) instead of factions.is_hidden. We write both.
+                try:
+                    sb.table("app_state").upsert({"id": 1, "ui_hidden_factions": hidden_list}).execute()
+                except Exception:
+                    pass
                 st.success("Saved.")
                 st.rerun()
             except Exception as e:
@@ -351,48 +362,11 @@ with week_tab:
 
         set_current_week(sb, next_week)
 
-        # Carry forward population (gentle change)
-        # - Survival ratio nudges population (small %)
-        # - War casualties (from this week's war logs) reduce population
+        # Carry forward population (survival can reduce it)
         try:
             pop_now = int(getattr(summary, "population", 450_000) or 450_000)
             surv = float(getattr(summary, "survival_ratio", 1.0) or 1.0)
-
-            # 1) Survival effect (gentle)
-            # At 0.0 survival, population shouldn't instantly evaporate.
-            # Clamp to [-1.0%, +0.3%] per week from food/water alone.
-            surv = max(0.0, min(1.25, surv))
-            surv_pct = (surv - 1.0) * 0.005
-            surv_pct = max(-0.01, min(0.003, surv_pct))
-
-            # 2) Social effect (gentle bonus)
-            social_pts = 0
-            try:
-                from utils.infrastructure_effects import social_points as _social_points
-
-                social_pts = int(_social_points(sb) or 0)
-            except Exception:
-                social_pts = 0
-            social_pts = max(0, social_pts)
-            social_pct = min(0.002, 0.0005 * float(social_pts))
-
-            # 3) War casualties (best-effort from `wars.result` JSON)
-            war_dead = 0
-            try:
-                wars = sb.table("wars").select("result").eq("week", week).execute().data or []
-                for w in wars:
-                    res = w.get("result") or {}
-                    ac = res.get("ally_casualties") or {}
-                    if isinstance(ac, dict):
-                        war_dead += sum(int(v or 0) for v in ac.values())
-            except Exception:
-                war_dead = 0
-            # Cap war impact at 0.5% weekly (to keep it gentle)
-            war_dead = min(int(war_dead), int(pop_now * 0.005))
-
-            pop_after_pct = int(round(pop_now * (1.0 + surv_pct + social_pct)))
-            pop_next = max(0, pop_after_pct - war_dead)
-
+            pop_next = max(0, int(round(pop_now * surv)))
             sb.table("population_state").upsert({"week": next_week, "population": pop_next}, on_conflict="week").execute()
         except Exception:
             pass
