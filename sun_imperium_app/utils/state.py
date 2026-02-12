@@ -40,7 +40,7 @@ def ensure_bootstrap(sb):
         _execute_with_retry(
             sb.table("weeks").insert({
                 "week": current_week,
-                # PostgREST expects JSON-serializable values
+                # PostgREST requires JSON-serializable values
                 "opened_at": datetime.now(timezone.utc).isoformat()
             })
         )
