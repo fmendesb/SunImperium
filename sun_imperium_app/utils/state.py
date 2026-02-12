@@ -40,7 +40,7 @@ def ensure_bootstrap(sb):
         _execute_with_retry(
             sb.table("weeks").insert({
                 "week": current_week,
-                # postgrest/httpx JSON encoder can't serialize datetime objects
+                # PostgREST expects JSON-serializable values
                 "opened_at": datetime.now(timezone.utc).isoformat()
             })
         )
@@ -62,7 +62,6 @@ def advance_week_pointer(sb):
 
     _execute_with_retry(
         sb.table("weeks").update({
-            # JSON-safe timestamp
             "closed_at": datetime.now(timezone.utc).isoformat()
         }).eq("week", cur)
     )
@@ -70,7 +69,6 @@ def advance_week_pointer(sb):
     _execute_with_retry(
         sb.table("weeks").insert({
             "week": nxt,
-            # JSON-safe timestamp
             "opened_at": datetime.now(timezone.utc).isoformat()
         })
     )
