@@ -83,59 +83,49 @@ tab_inventory, tab_gather, tab_discovery, tab_craft, tab_vendor, tab_jobs = st.t
 with tab_inventory:
     st.subheader("🎒 Inventory")
 
-inv_rows = crafting.list_inventory(sb, player_id=player_id)
+    inv = crafting.list_inventory(sb, player_id)
+    if not inv:
+        st.caption("Inventory is empty.")
+    else:
+        # Table display
+        inv_rows = [{"Item": r["item_name"], "Qty": int(r["quantity"]), "Tier": crafting._tier_from_name(r["item_name"])} for r in inv]
+        st.dataframe(inv_rows, use_container_width=True, hide_index=True)
 
-if not inv_rows:
-    st.info("Your inventory is empty.")
-else:
-    # Build editable table
-    base = [{"Item": r["item_name"], "Qty": int(r.get("qty") or r.get("quantity") or 0)} for r in inv_rows]
-    df0 = pd.DataFrame(base)
-    st.caption("Edit quantities and click Save (useful for DM adjustments/testing).")
-
-    edited = st.data_editor(
-        df0,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Item": st.column_config.TextColumn(disabled=True),
-            "Qty": st.column_config.NumberColumn(min_value=0, step=1),
-        },
-        key="inv_editor",
-    )
-
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("Save inventory", type="primary"):
-            # Apply deltas
-            orig = {r["item_name"]: int(r.get("qty") or r.get("quantity") or 0) for r in inv_rows}
-            for _, row in edited.iterrows():
-                name = row["Item"]
-                new_qty = int(row["Qty"] or 0)
-                delta = new_qty - int(orig.get(name, 0))
-                if delta:
-                    crafting.inventory_adjust(sb, player_id=player_id, item_name=name, delta=delta)
-            st.success("Saved.")
-            st.rerun()
-    with c2:
-        st.caption("Sending items uses the controls below.")
-
-    st.markdown("#### Send items")
-    recipients = sb.table("players").select("id,name").order("name").execute().data or []
-    rec_map = {r["name"]: r["id"] for r in recipients if r.get("id") and r.get("name")}
-    if rec_map:
-        pick_item = st.selectbox("Item", list(df0["Item"]))
-        pick_rec = st.selectbox("Recipient", list(rec_map.keys()))
-        max_send = int(orig.get(pick_item, 0))
-        send_qty = st.number_input("Amount", min_value=1, max_value=max_send if max_send > 0 else 1, value=1)
-        if st.button("Send"):
-            if max_send <= 0:
-                st.error("You don't have any of that item.")
-            else:
-                crafting.transfer_item(sb, from_player_id=player_id, to_player_id=rec_map[pick_rec], item_name=pick_item, qty=int(send_qty))
-                st.success("Sent.")
+        st.markdown("### Adjust quantity")
+        colA, colB, colC = st.columns([0.55, 0.20, 0.25])
+        with colA:
+            item_pick = st.selectbox("Item", [r["item_name"] for r in inv], key="inv_item_pick")
+        with colB:
+            delta = st.number_input("Delta (+/-)", min_value=-99, max_value=99, value=1, step=1, key="inv_delta")
+        with colC:
+            if st.button("Apply"):
+                crafting.inventory_adjust(sb, player_id, item_pick, int(delta))
                 st.rerun()
-st.subheader("⛏️ Gathering")
+
+        st.markdown("### Send item to another player")
+        recipients = [p for p in players if p["id"] != player_id]
+        if not recipients:
+            st.caption("No other players available.")
+        else:
+            c1, c2, c3, c4 = st.columns([0.40, 0.30, 0.15, 0.15])
+            with c1:
+                send_item = st.selectbox("Item to send", [r["item_name"] for r in inv], key="send_item")
+            with c2:
+                recipient_name = st.selectbox("Recipient", [p["name"] for p in recipients], key="send_recipient")
+            with c3:
+                max_qty = next(r["quantity"] for r in inv if r["item_name"] == send_item)
+                send_qty = st.number_input("Qty", min_value=1, max_value=int(max_qty), value=1, step=1, key="send_qty")
+            with c4:
+                if st.button("Send"):
+                    to_id = next(p["id"] for p in recipients if p["name"] == recipient_name)
+                    crafting.transfer_item(sb, player_id, to_id, send_item, int(send_qty))
+                    st.rerun()
+
+# -------------------------
+# Gather: only gathering professions
+# -------------------------
+with tab_gather:
+    st.subheader("⛏️ Gathering")
 
     gather_professions = set(crafting.get_gather_professions(sb))
     available_gather = [p for p in professions if p in gather_professions]
