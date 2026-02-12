@@ -2,10 +2,51 @@
 import json
 import random
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 TIER_RE = re.compile(r"\(T(\d+)\)")
+
+
+# ---------------------------
+# Supabase execute retry
+# ---------------------------
+
+
+def _sb_execute(req, *, retries: int = 3, base_sleep: float = 0.25):
+    """Execute a PostgREST request with small retries.
+
+    Streamlit Cloud occasionally throws transient httpx.ReadError / transport
+    errors. Retrying a couple times makes the UX far less brittle.
+    """
+
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return req.execute()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = f"{type(e).__name__}: {e}"
+            is_transient = any(
+                k in msg
+                for k in (
+                    "ReadError",
+                    "ConnectError",
+                    "RemoteProtocolError",
+                    "Server disconnected",
+                    "timed out",
+                    "Timeout",
+                    "502",
+                    "503",
+                    "504",
+                )
+            )
+            if (attempt + 1) >= retries or not is_transient:
+                raise
+            time.sleep(base_sleep * (2**attempt))
+    # should never reach
+    raise last_err  # type: ignore[misc]
 
 
 # ---------------------------
@@ -49,14 +90,14 @@ def _safe_json(v):
 def get_current_week(sb) -> int:
     # Try app_state(id=1) -> current_week, else app_settings.current_week, else 1
     try:
-        r = sb.table("app_state").select("current_week").eq("id", 1).single().execute()
+        r = _sb_execute(sb.table("app_state").select("current_week").eq("id", 1).single())
         if r.data and "current_week" in r.data:
             return int(r.data["current_week"])
     except Exception:
         pass
 
     try:
-        r = sb.table("app_settings").select("current_week").limit(1).execute()
+        r = _sb_execute(sb.table("app_settings").select("current_week").limit(1))
         if r.data:
             return int(r.data[0].get("current_week") or 1)
     except Exception:
@@ -66,18 +107,18 @@ def get_current_week(sb) -> int:
 
 
 def list_players(sb) -> List[Dict[str, Any]]:
-    r = sb.table("players").select("id,name").order("name").execute()
+    r = _sb_execute(sb.table("players").select("id,name").order("name"))
     return r.data or []
 
 
 def log(sb, player_id: str, kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
     try:
-        sb.table("activity_log").insert({
+        _sb_execute(sb.table("activity_log").insert({
             "player_id": player_id,
             "kind": kind,
             "message": message,
             "meta": meta or {},
-        }).execute()
+        }))
     except Exception:
         # If activity_log schema differs, fail silently (but app keeps working)
         pass
@@ -85,7 +126,13 @@ def log(sb, player_id: str, kind: str, message: str, meta: Optional[Dict[str, An
 
 def get_activity_log(sb, player_id: str, limit: int = 25) -> List[Dict[str, Any]]:
     try:
-        r = sb.table("activity_log").select("created_at,message,kind,meta").eq("player_id", player_id).order("created_at", desc=True).limit(limit).execute()
+        r = _sb_execute(
+            sb.table("activity_log")
+            .select("created_at,message,kind,meta")
+            .eq("player_id", player_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
         return r.data or []
     except Exception:
         return []
