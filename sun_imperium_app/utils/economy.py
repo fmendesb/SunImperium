@@ -360,18 +360,10 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
         tier = int(it.get("tier") or 1)
         rarity = (it.get("rarity") or "Common").strip() or "Common"
         region = (it.get("region") or "").strip()
-        raw_family = (it.get("family") or "").strip()
-        family = raw_family
+        family = (it.get("family") or "").strip()
 
-        # Backfill missing family so the Economy page can show clear targets.
         if not family and region:
             family = _infer_family_from_region(week, name, region)
-            if family:
-                # Best-effort persistence (safe if row doesn't exist / RLS blocks)
-                try:
-                    sb.table("gathering_items").update({"family": family}).eq("name", name).eq("region", region).execute()
-                except Exception:
-                    pass
 
         price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
         base_price = float(price or 0)
@@ -634,3 +626,29 @@ def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[
                 "player_payout": summary.player_payout,
             }
         ).execute()
+def backfill_gathering_item_families(sb, week: int = 1) -> int:
+    """Best-effort: fill missing gathering_items.family based on region rules.
+
+    Returns number of rows updated. Does NOT overwrite existing non-empty family.
+    """
+    items = sb.table("gathering_items").select("name,region,family").execute().data or []
+    updates = []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        region = (it.get("region") or "").strip()
+        family = (it.get("family") or "").strip()
+        if not name or not region or family:
+            continue
+        fam = _infer_family_from_region(week, name, region)
+        if fam:
+            updates.append({"name": name, "family": fam})
+
+    if not updates:
+        return 0
+
+    chunk = 200
+    for i in range(0, len(updates), chunk):
+        sb.table("gathering_items").upsert(updates[i:i+chunk], on_conflict="name").execute()
+
+    return len(updates)
+
