@@ -29,6 +29,38 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def _normalize_price_gp(price: float, *, tier: int | None = None, rarity: str | None = None) -> float:
+    """Best-effort normalization for item prices.
+
+    Prices in `gathering_items` are intended to be stored in **gp**.
+    In practice, some imports accidentally store gp values multiplied by 10,000
+    (treating gp as if it were copper). That yields absurd prices (eg ~13,000gp
+    for a T1 material) and then our demand model collapses quantities to 0.
+
+    Heuristic: if the price is *very* large for low tiers, assume it's scaled
+    by 10,000 and convert it back.
+    """
+
+    try:
+        p = float(price or 0)
+    except Exception:
+        return 0.0
+
+    if p <= 0:
+        return 0.0
+
+    t = int(tier) if tier is not None and str(tier).strip() != "" else None
+    r = (rarity or "").strip().lower()
+
+    # Low-tier / common items should never be in the thousands of gp.
+    if p >= 1000:
+        if (t is not None and t <= 3) or (r in {"common", "uncommon", ""}):
+            p = p / 10000.0
+
+    # Guard against negative / nonsense.
+    return max(0.0, p)
+
+
 def _stable_seed(week: int, key: str) -> int:
     h = hashlib.sha256(f"{week}:{key}".encode("utf-8")).hexdigest()
     return int(h[:8], 16)
@@ -366,7 +398,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
             family = _infer_family_from_region(week, name, region)
 
         price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
-        base_price = float(price or 0)
+        base_price = _normalize_price_gp(float(price or 0), tier=tier, rarity=rarity)
 
         # Supply improvements lower prices.
         rs = region_supply(sb, week, region) if region else 1.0
@@ -626,29 +658,3 @@ def write_week_economy(sb, summary: WeekEconomyResult, per_item_rows: List[Dict[
                 "player_payout": summary.player_payout,
             }
         ).execute()
-def backfill_gathering_item_families(sb, week: int = 1) -> int:
-    """Best-effort: fill missing gathering_items.family based on region rules.
-
-    Returns number of rows updated. Does NOT overwrite existing non-empty family.
-    """
-    items = sb.table("gathering_items").select("name,region,family").execute().data or []
-    updates = []
-    for it in items:
-        name = (it.get("name") or "").strip()
-        region = (it.get("region") or "").strip()
-        family = (it.get("family") or "").strip()
-        if not name or not region or family:
-            continue
-        fam = _infer_family_from_region(week, name, region)
-        if fam:
-            updates.append({"name": name, "family": fam})
-
-    if not updates:
-        return 0
-
-    chunk = 200
-    for i in range(0, len(updates), chunk):
-        sb.table("gathering_items").upsert(updates[i:i+chunk], on_conflict="name").execute()
-
-    return len(updates)
-
