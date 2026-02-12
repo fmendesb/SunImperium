@@ -131,96 +131,33 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
 
 
 def describe_infrastructure_effect(name: str) -> str:
-    """Human-friendly effect string for UI."""
-    effs = EFFECTS.get((name or "").strip())
-    if not effs:
-        return ""
-    parts: list[str] = []
-    for e in effs:
-        kind = e.get("kind")
-        target = (e.get("target") or "").replace("_", " ")
-        value = e.get("value")
-        if kind == "power_bonus":
-            parts.append(f"+{value} {target} power")
-        elif kind == "success_bonus":
-            parts.append(f"+{value}% {target} success")
-        elif kind == "production_bonus":
-            parts.append(f"+{value}% economy output")
-        elif kind == "social_bonus":
-            parts.append(f"+{value} social points")
-        elif kind == "multiplier":
-            # e.g., x1.05
-            try:
-                parts.append(f"x{float(value):.2f} {target}")
-            except Exception:
-                parts.append(f"x{value} {target}")
-        else:
-            parts.append(f"{kind}: {value} {target}".strip())
-    return " · ".join(parts)
+    """Human-readable description of what an infrastructure purchase does.
 
+    Used by the Shop page so players see clear +1/+2/+3, % bonuses, multipliers,
+    and social points.
+    """
+    name = (name or "").strip()
+    eff = effect_for_infrastructure(name)
+    prereq = prereq_name_for_infrastructure(name)
 
-def _owned_names(sb) -> list[str]:
-    try:
-        rows = sb.table("infrastructure_owned").select("name").execute().data or []
-        return [str(r.get("name") or "").strip() for r in rows if r.get("name")]
-    except Exception:
-        return []
+    bits: list[str] = []
+    if prereq:
+        bits.append(f"Prerequisite: {prereq}.")
 
+    if not eff:
+        return " ".join(bits) if bits else ""
 
-def production_multiplier_owned(sb) -> float:
-    mult = 1.0
-    for name in _owned_names(sb):
-        for e in EFFECTS.get(name, []):
-            if e.get("kind") == "multiplier" and e.get("target") in {"production", "economy"}:
-                try:
-                    mult *= float(e.get("value") or 1.0)
-                except Exception:
-                    pass
-            if e.get("kind") == "production_bonus":
-                try:
-                    mult *= 1.0 + (float(e.get("value") or 0.0) / 100.0)
-                except Exception:
-                    pass
-    return float(mult)
+    if eff.kind == "power_bonus":
+        bits.append(f"+{int(eff.value)} power to {eff.target.title()} units.")
+    elif eff.kind == "success_bonus_pct":
+        bits.append(f"+{int(eff.value)}% {eff.target.title()} mission success chance.")
+    elif eff.kind == "multiplier":
+        bits.append(f"{eff.value:.2f}x production multiplier.")
+    elif eff.kind == "social_bonus":
+        bits.append(f"+{int(eff.value)} social points (improves stability/economy).")
+    else:
+        # generic fallback
+        unit = eff.unit or ""
+        bits.append(f"{eff.target}: {eff.value}{unit}.")
 
-
-def social_points_owned(sb) -> int:
-    pts = 0
-    for name in _owned_names(sb):
-        for e in EFFECTS.get(name, []):
-            if e.get("kind") == "social_bonus":
-                try:
-                    pts += int(e.get("value") or 0)
-                except Exception:
-                    pass
-    return int(pts)
-
-
-def production_multiplier_all(sb=None) -> float:
-    """Baseline assumes all infrastructure is owned (optimistic baseline)."""
-    mult = 1.0
-    for name, effs in EFFECTS.items():
-        for e in effs:
-            if e.get("kind") == "multiplier" and e.get("target") in {"production", "economy"}:
-                try:
-                    mult *= float(e.get("value") or 1.0)
-                except Exception:
-                    pass
-            if e.get("kind") == "production_bonus":
-                try:
-                    mult *= 1.0 + (float(e.get("value") or 0.0) / 100.0)
-                except Exception:
-                    pass
-    return float(mult)
-
-
-def social_points_all(sb=None) -> int:
-    pts = 0
-    for name, effs in EFFECTS.items():
-        for e in effs:
-            if e.get("kind") == "social_bonus":
-                try:
-                    pts += int(e.get("value") or 0)
-                except Exception:
-                    pass
-    return int(pts)
+    return " ".join(bits)
