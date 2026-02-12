@@ -128,31 +128,55 @@ def success_bonus_pct_for_category(sb: Client, category: str) -> float:
         if eff and eff.kind == "success_bonus_pct" and eff.target == category:
             bonus += float(eff.value)
     return bonus
+def production_multiplier_owned(sb: Client) -> float:
+    """Product of all owned 'production' multipliers. Defaults to 1.0."""
+    owned_names = get_owned_infrastructure_names(sb)
+    mult = 1.0
+    for name in owned_names:
+        eff = effect_for_infrastructure(name)
+        if eff and eff.kind == "multiplier" and eff.target == "production":
+            try:
+                mult *= float(eff.value)
+            except Exception:
+                continue
+    # Clamp to avoid runaway values
+    return max(0.1, min(10.0, float(mult)))
+
+
+def social_points_owned(sb: Client) -> int:
+    """Sum of social points from owned social infrastructure."""
+    owned_names = get_owned_infrastructure_names(sb)
+    pts = 0
+    for name in owned_names:
+        eff = effect_for_infrastructure(name)
+        if eff and eff.kind == "social_bonus" and eff.target == "social":
+            try:
+                pts += int(eff.value)
+            except Exception:
+                continue
+    return max(0, pts)
 
 
 def describe_infrastructure_effect(name: str) -> str:
-    """Return a short, readable effect string for UI display."""
+    """Human-readable effect string for the shop UI."""
+    name = (name or "").strip()
     eff = effect_for_infrastructure(name)
+    prereq = prereq_name_for_infrastructure(name)
+    parts = []
+    if prereq:
+        parts.append(f"Requires: {prereq}")
     if not eff:
+        if parts:
+            return " · ".join(parts)
         return ""
-
-    # Friendly target naming
-    tgt = eff.target
-    if tgt in {"guardian", "archer", "mage", "cleric"}:
-        tgt_label = tgt.title() + "s"
-    elif tgt == "production":
-        tgt_label = "Production"
-    elif tgt == "social":
-        tgt_label = "Social"
-    else:
-        tgt_label = tgt.title()
-
     if eff.kind == "power_bonus":
-        return f"{tgt_label}: +{int(eff.value)} power"
-    if eff.kind == "success_bonus_pct":
-        return f"{tgt_label}: +{int(eff.value)}% success"
-    if eff.kind == "multiplier":
-        return f"{tgt_label}: x{eff.value:g} output"
-    if eff.kind == "social_bonus":
-        return f"{tgt_label}: +{int(eff.value)} social points"
-    return ""
+        parts.append(f"+{int(eff.value)} power to {eff.target.title()} units")
+    elif eff.kind == "success_bonus_pct":
+        parts.append(f"+{int(eff.value)}% success chance ({eff.target})")
+    elif eff.kind == "multiplier":
+        parts.append(f"x{float(eff.value):g} production")
+    elif eff.kind == "social_bonus":
+        parts.append(f"+{int(eff.value)} social points")
+    else:
+        parts.append(f"{eff.kind}: {eff.value}{eff.unit or ''} ({eff.target})")
+    return " · ".join(parts)
