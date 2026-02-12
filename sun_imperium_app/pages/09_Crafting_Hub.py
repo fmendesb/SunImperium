@@ -1,332 +1,802 @@
-import streamlit as st
-from datetime import datetime, timezone
+# sun_imperium_app/utils/crafting.py
+import json
+import random
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from utils.nav import page_config, sidebar
+TIER_RE = re.compile(r"\(T(\d+)\)")
 
-from utils.supabase_client import get_supabase
-import utils.crafting as crafting
 
-page_config("Crafting Hub", "🧰")
-sidebar("🛠 Crafting Hub")
-st.title("🧰 Crafting Hub")
+# ---------------------------
+# Supabase execute retry
+# ---------------------------
 
-sb = get_supabase()
-week = crafting.get_current_week(sb)
 
-players = crafting.list_players(sb)
-if not players:
-    st.warning("No players found in Supabase table `players`.")
-    st.stop()
+def _sb_execute(req, *, retries: int = 3, base_sleep: float = 0.25):
+    """Execute a PostgREST request with small retries.
 
-player_name = st.sidebar.selectbox("Select Player", [p["name"] for p in players], index=0)
-player = next(p for p in players if p["name"] == player_name)
-player_id = player["id"]
+    Streamlit Cloud occasionally throws transient httpx.ReadError / transport
+    errors. Retrying a couple times makes the UX far less brittle.
+    """
 
-progress = crafting.ensure_player_progress(sb, player_id)
-professions = crafting.list_professions_for_player(progress)
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return req.execute()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = f"{type(e).__name__}: {e}"
+            is_transient = any(
+                k in msg
+                for k in (
+                    "ReadError",
+                    "ConnectError",
+                    "RemoteProtocolError",
+                    "Server disconnected",
+                    "timed out",
+                    "Timeout",
+                    "502",
+                    "503",
+                    "504",
+                )
+            )
+            if (attempt + 1) >= retries or not is_transient:
+                raise
+            time.sleep(base_sleep * (2**attempt))
+    # should never reach
+    raise last_err  # type: ignore[misc]
 
-# -------------------------
-# Header: Skills + XP bars
-# -------------------------
-st.subheader("🧠 Skills & XP")
 
-if not professions:
-    st.info("This player has no professions yet (player_progress.skills is empty).")
-else:
-    for prof in professions:
-        skill = (progress.get("skills") or {}).get(prof) or {"level": 1, "xp": 0}
-        level = int(skill.get("level", 1))
-        xp = int(skill.get("xp", 0))
+# ---------------------------
+# Helpers
+# ---------------------------
 
-        unlocked_tier = crafting.max_tier_for_level(sb, level)
-        visible_cap = unlocked_tier + 2
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-        xp_this = crafting.xp_required_for_level(sb, level)
-        xp_next = crafting.xp_required_for_level(sb, min(20, level + 1))
-        denom = max(1, xp_next - xp_this)
-        pct = max(0.0, min(1.0, (xp - xp_this) / denom))
 
-        c1, c2, c3 = st.columns([0.42, 0.38, 0.20])
-        with c1:
-            st.markdown(f"**{prof}**")
-            st.caption(f"Level {level} • Unlocked Tier T{unlocked_tier} • Visible up to T{visible_cap}")
-        with c2:
-            st.progress(pct)
-            st.caption(f"XP {xp} • next level at {xp_next}")
-        with c3:
-            if st.button("➖ XP", key=f"xp_minus_{prof}"):
-                crafting.set_skill_xp_delta(sb, player_id, prof, -1)
-                st.rerun()
-            if st.button("➕ XP", key=f"xp_plus_{prof}"):
-                crafting.set_skill_xp_delta(sb, player_id, prof, +1)
-                st.rerun()
+def _tier_from_name(name: str) -> int:
+    m = TIER_RE.search(name or "")
+    return int(m.group(1)) if m else 0
 
-with st.expander("📜 Activity Log", expanded=False):
-    logs = crafting.get_activity_log(sb, player_id, limit=30)
-    if not logs:
-        st.caption("No activity yet.")
+
+def _base_name(name: str) -> str:
+    return re.sub(r"\s*\(T\d+\)\s*$", "", name or "").strip()
+
+
+def _clamp(x: int, a: int, b: int) -> int:
+    return max(a, min(b, x))
+
+
+def _safe_json(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, dict)):
+        return v
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return []
+    return []
+
+
+# ---------------------------
+# Basic app state
+# ---------------------------
+
+def get_current_week(sb) -> int:
+    # Try app_state(id=1) -> current_week, else app_settings.current_week, else 1
+    try:
+        r = _sb_execute(sb.table("app_state").select("current_week").eq("id", 1).single())
+        if r.data and "current_week" in r.data:
+            return int(r.data["current_week"])
+    except Exception:
+        pass
+
+    try:
+        r = _sb_execute(sb.table("app_settings").select("current_week").limit(1))
+        if r.data:
+            return int(r.data[0].get("current_week") or 1)
+    except Exception:
+        pass
+
+    return 1
+
+
+def list_players(sb) -> List[Dict[str, Any]]:
+    r = _sb_execute(sb.table("players").select("id,name").order("name"))
+    return r.data or []
+
+
+def log(sb, player_id: str, kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        _sb_execute(sb.table("activity_log").insert({
+            "player_id": player_id,
+            "kind": kind,
+            "message": message,
+            "meta": meta or {},
+        }))
+    except Exception:
+        # If activity_log schema differs, fail silently (but app keeps working)
+        pass
+
+
+def get_activity_log(sb, player_id: str, limit: int = 25) -> List[Dict[str, Any]]:
+    try:
+        r = _sb_execute(
+            sb.table("activity_log")
+            .select("created_at,message,kind,meta")
+            .eq("player_id", player_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+# ---------------------------
+# XP / Level / Tier
+# ---------------------------
+
+DEFAULT_TIER_UNLOCKS = [
+    {"tier": 1, "unlocks_at_level": 1},
+    {"tier": 2, "unlocks_at_level": 3},
+    {"tier": 3, "unlocks_at_level": 6},
+    {"tier": 4, "unlocks_at_level": 9},
+    {"tier": 5, "unlocks_at_level": 13},
+    {"tier": 6, "unlocks_at_level": 17},
+    {"tier": 7, "unlocks_at_level": 20},
+]
+
+DEFAULT_XP_TABLE = {i: (i - 1) * 10 for i in range(1, 21)}  # level 2 at 10 xp, etc.
+
+
+def _load_xp_table(sb) -> Dict[int, int]:
+    try:
+        r = sb.table("xp_table").select("level,xp_required").order("level").execute()
+        if r.data:
+            return {int(x["level"]): int(x["xp_required"]) for x in r.data}
+    except Exception:
+        pass
+    return DEFAULT_XP_TABLE
+
+
+def _load_tier_unlocks(sb) -> List[Dict[str, int]]:
+    try:
+        r = sb.table("tier_unlocks").select("tier,unlocks_at_level").order("tier").execute()
+        if r.data:
+            return [{"tier": int(x["tier"]), "unlocks_at_level": int(x["unlocks_at_level"])} for x in r.data]
+    except Exception:
+        pass
+    return DEFAULT_TIER_UNLOCKS
+
+
+def compute_level_from_xp(sb, total_xp: int) -> int:
+    xp_table = _load_xp_table(sb)  # cumulative thresholds
+    lvl = 1
+    for k in sorted(xp_table.keys()):
+        if total_xp >= xp_table[k]:
+            lvl = k
+    return _clamp(lvl, 1, 20)
+
+
+def xp_required_for_level(sb, level: int) -> int:
+    return int(_load_xp_table(sb).get(int(level), 0))
+
+
+def max_tier_for_level(sb, level: int) -> int:
+    tier = 1
+    for row in _load_tier_unlocks(sb):
+        if int(level) >= int(row["unlocks_at_level"]):
+            tier = max(tier, int(row["tier"]))
+    return tier
+
+
+# ---------------------------
+# Player Progress
+# ---------------------------
+
+def ensure_player_progress(sb, player_id: str) -> Dict[str, Any]:
+    """
+    player_progress supports:
+      - player_id (uuid)
+      - skills (jsonb)  -> {profession: {level:int, xp:int}}
+      - known_recipes (jsonb array) optional
+      - discovered_recipes (jsonb array) optional
+    """
+    try:
+        r = sb.table("player_progress").select("player_id,skills,known_recipes,discovered_recipes").eq("player_id", player_id).execute()
+        if r.data:
+            row = r.data[0]
+            row["skills"] = row.get("skills") or {}
+            row["known_recipes"] = row.get("known_recipes") or []
+            row["discovered_recipes"] = row.get("discovered_recipes") or row["known_recipes"]
+            return row
+    except Exception:
+        pass
+
+    # fallback schema without discovered_recipes
+    try:
+        r = sb.table("player_progress").select("player_id,skills,known_recipes").eq("player_id", player_id).execute()
+        if r.data:
+            row = r.data[0]
+            row["skills"] = row.get("skills") or {}
+            row["known_recipes"] = row.get("known_recipes") or []
+            row["discovered_recipes"] = row["known_recipes"]
+            return row
+    except Exception:
+        pass
+
+    # create new
+    base = {"player_id": player_id, "skills": {}, "known_recipes": [], "discovered_recipes": []}
+    try:
+        sb.table("player_progress").insert(base).execute()
+    except Exception:
+        sb.table("player_progress").insert({"player_id": player_id, "skills": {}, "known_recipes": []}).execute()
+    return base
+
+
+def list_professions_for_player(progress: Dict[str, Any]) -> List[str]:
+    skills = progress.get("skills") or {}
+    out = []
+    for k, v in skills.items():
+        if k and isinstance(v, dict):
+            out.append(k)
+    return sorted(out)
+
+
+def set_skill_xp_delta(sb, player_id: str, profession: str, delta_xp: int) -> None:
+    prog = ensure_player_progress(sb, player_id)
+    skills = prog.get("skills") or {}
+
+    s = skills.get(profession) or {"level": 1, "xp": 0}
+    xp = max(0, int(s.get("xp", 0)) + int(delta_xp))
+    lvl = compute_level_from_xp(sb, xp)
+
+    s["xp"] = xp
+    s["level"] = lvl
+    skills[profession] = s
+
+    sb.table("player_progress").update({"skills": skills}).eq("player_id", player_id).execute()
+    log(sb, player_id, "xp", f"{profession}: XP {'+' if delta_xp >= 0 else ''}{delta_xp}", {"profession": profession, "delta": delta_xp})
+
+
+# ---------------------------
+# Inventory (hide zeros)
+# ---------------------------
+
+def list_inventory(sb, player_id: str) -> List[Dict[str, Any]]:
+    r = sb.table("player_inventory").select("item_name,qty,quantity").eq("player_id", player_id).execute()
+    rows = []
+    for x in (r.data or []):
+        q = x.get("quantity")
+        if q is None:
+            q = x.get("qty", 0)
+        q = int(q or 0)
+        if q <= 0:
+            continue  # hide zero rows
+        rows.append({"item_name": x["item_name"], "quantity": q})
+    return rows
+
+
+def inventory_adjust(sb, player_id: str, item_name: str, delta: int) -> None:
+    inv = sb.table("player_inventory").select("qty,quantity").eq("player_id", player_id).eq("item_name", item_name).execute()
+    cur = 0
+    if inv.data:
+        cur = inv.data[0].get("quantity")
+        if cur is None:
+            cur = inv.data[0].get("qty", 0)
+        cur = int(cur or 0)
+
+    new = max(0, cur + int(delta))
+
+    if inv.data:
+        sb.table("player_inventory").update({"qty": new, "quantity": new}).eq("player_id", player_id).eq("item_name", item_name).execute()
     else:
-        for row in logs:
-            st.write(f"• {row.get('message','')}")
-            if row.get("created_at"):
-                st.caption(str(row["created_at"]))
+        if new > 0:
+            sb.table("player_inventory").insert({"player_id": player_id, "item_name": item_name, "qty": new, "quantity": new}).execute()
 
-st.divider()
+    log(sb, player_id, "inventory", f"{item_name} {'+' if delta>=0 else ''}{delta}", {"item_name": item_name, "delta": delta})
 
-tab_inventory, tab_gather, tab_discovery, tab_craft, tab_vendor, tab_jobs = st.tabs(
-    ["Inventory", "Gather", "Recipes (Discovery)", "Craft", "Vendor", "Jobs"]
-)
 
-# -------------------------
-# Inventory (no 0 rows) + clean send section
-# -------------------------
-with tab_inventory:
-    st.subheader("🎒 Inventory")
+def transfer_item(sb, from_player_id: str, to_player_id: str, item_name: str, qty: int) -> None:
+    qty = int(qty)
+    if qty <= 0:
+        return
 
-    inv = crafting.list_inventory(sb, player_id)
-    if not inv:
-        st.caption("Inventory is empty.")
+    inv = sb.table("player_inventory").select("qty,quantity").eq("player_id", from_player_id).eq("item_name", item_name).execute()
+    if not inv.data:
+        return
+
+    cur = inv.data[0].get("quantity")
+    if cur is None:
+        cur = inv.data[0].get("qty", 0)
+    cur = int(cur or 0)
+    if cur <= 0:
+        return
+
+    qty = min(qty, cur)
+    sb.table("player_inventory").update({"qty": cur - qty, "quantity": cur - qty}).eq("player_id", from_player_id).eq("item_name", item_name).execute()
+
+    inv2 = sb.table("player_inventory").select("qty,quantity").eq("player_id", to_player_id).eq("item_name", item_name).execute()
+    cur2 = 0
+    if inv2.data:
+        cur2 = inv2.data[0].get("quantity")
+        if cur2 is None:
+            cur2 = inv2.data[0].get("qty", 0)
+        cur2 = int(cur2 or 0)
+
+    if inv2.data:
+        sb.table("player_inventory").update({"qty": cur2 + qty, "quantity": cur2 + qty}).eq("player_id", to_player_id).eq("item_name", item_name).execute()
     else:
-        # Table display
-        inv_rows = [{"Item": r["item_name"], "Qty": int(r["quantity"]), "Tier": crafting._tier_from_name(r["item_name"])} for r in inv]
-        st.dataframe(inv_rows, use_container_width=True, hide_index=True)
+        sb.table("player_inventory").insert({"player_id": to_player_id, "item_name": item_name, "qty": qty, "quantity": qty}).execute()
 
-        st.markdown("### Adjust quantity")
-        colA, colB, colC = st.columns([0.55, 0.20, 0.25])
-        with colA:
-            item_pick = st.selectbox("Item", [r["item_name"] for r in inv], key="inv_item_pick")
-        with colB:
-            delta = st.number_input("Delta (+/-)", min_value=-99, max_value=99, value=1, step=1, key="inv_delta")
-        with colC:
-            if st.button("Apply"):
-                crafting.inventory_adjust(sb, player_id, item_pick, int(delta))
-                st.rerun()
+    log(sb, from_player_id, "transfer", f"Sent {qty} x {item_name}", {"to_player_id": to_player_id, "qty": qty})
+    log(sb, to_player_id, "transfer", f"Received {qty} x {item_name}", {"from_player_id": from_player_id, "qty": qty})
 
-        st.markdown("### Send item to another player")
-        recipients = [p for p in players if p["id"] != player_id]
-        if not recipients:
-            st.caption("No other players available.")
-        else:
-            c1, c2, c3, c4 = st.columns([0.40, 0.30, 0.15, 0.15])
-            with c1:
-                send_item = st.selectbox("Item to send", [r["item_name"] for r in inv], key="send_item")
-            with c2:
-                recipient_name = st.selectbox("Recipient", [p["name"] for p in recipients], key="send_recipient")
-            with c3:
-                max_qty = next(r["quantity"] for r in inv if r["item_name"] == send_item)
-                send_qty = st.number_input("Qty", min_value=1, max_value=int(max_qty), value=1, step=1, key="send_qty")
-            with c4:
-                if st.button("Send"):
-                    to_id = next(p["id"] for p in recipients if p["name"] == recipient_name)
-                    crafting.transfer_item(sb, player_id, to_id, send_item, int(send_qty))
-                    st.rerun()
 
-# -------------------------
-# Gather: only gathering professions
-# -------------------------
-with tab_gather:
-    st.subheader("⛏️ Gathering")
+# ---------------------------
+# Gathering
+# ---------------------------
 
-    gather_professions = set(crafting.get_gather_professions(sb))
-    available_gather = [p for p in professions if p in gather_professions]
+def get_gather_professions(sb) -> List[str]:
+    r = sb.table("gathering_items").select("profession").execute()
+    return sorted({row["profession"] for row in (r.data or []) if row.get("profession")})
 
-    if not available_gather:
-        st.warning("This player has no gathering professions (only crafting).")
-    else:
-        gp = st.selectbox("Gathering profession", available_gather, key="g_prof")
-        roll_total = st.number_input("Roll total (d20 + mods)", min_value=0, max_value=100, value=10, step=1, key="g_roll")
 
-        if st.button("🎲 Roll Gathering"):
-            prev = crafting.roll_gathering_preview(sb, player_id, gp, int(roll_total))
-            st.session_state["g_prev"] = prev
+def dc_for_target_tier(unlocked_tier: int, target_tier: int) -> int:
+    # DC10 for own tier, DC15 for +1, DC20 for +2
+    if target_tier <= unlocked_tier:
+        return 10
+    if target_tier == unlocked_tier + 1:
+        return 15
+    return 20
 
-        prev = st.session_state.get("g_prev")
-        if prev:
-            if prev.get("failed"):
-                st.error("No item found this time.")
-            else:
-                st.markdown(f"**Result:** {prev['item_name']} (T{prev['tier']} • DC {prev['dc']})")
-                if prev.get("description"):
-                    st.caption(prev["description"])
-                if prev.get("use"):
-                    st.caption(prev["use"])
-                st.info(f"XP gain: **{prev['xp_gain']}**")
 
-                if st.button("✅ Add to inventory (Gathered)"):
-                    crafting.apply_gather_result(sb, player_id, prev)
-                    st.session_state.pop("g_prev", None)
-                    st.rerun()
+def gathered_tier_from_roll(unlocked_tier: int, roll_total: int) -> Optional[int]:
+    # close enough to test3 style: higher rolls push tier up (cap +2)
+    if unlocked_tier == 1 and roll_total < 10:
+        return None
+    if roll_total >= 22:
+        return unlocked_tier + 2
+    if roll_total >= 18:
+        return unlocked_tier + 1
+    if roll_total >= 12:
+        return unlocked_tier
+    return max(1, unlocked_tier - 1)
 
-# -------------------------
-# Discovery: Try = confirm/consume immediately
-# -------------------------
-with tab_discovery:
-    st.subheader("🧪 Recipes (Discovery)")
 
-    all_recipes = crafting.list_all_recipes(sb)
-    craft_profs = sorted({r["profession"] for r in all_recipes if r.get("profession")})
-    if not craft_profs:
-        st.info("No recipes in database yet.")
-    else:
-        disc_prof = st.selectbox("Crafting profession", craft_profs, key="disc_prof")
-        inv = crafting.list_inventory(sb, player_id)
-        inv_items = [r["item_name"] for r in inv]
+def choose_random_gather_item(sb, profession: str, tier: int) -> Optional[Dict[str, Any]]:
+    r = sb.table("gathering_items").select("name,description,use,profession,tier").eq("profession", profession).eq("tier", int(tier)).execute()
+    items = r.data or []
+    if not items:
+        return None
+    return random.choice(items)
 
-        allow_dupes = crafting.profession_allows_duplicate_components(sb, disc_prof)
 
-        if not inv_items:
-            st.warning("You need items in inventory to attempt discovery.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                i1 = st.selectbox("Item 1", inv_items, key="d_i1")
-            with c2:
-                opts2 = inv_items if allow_dupes else [x for x in inv_items if x != i1]
-                i2 = st.selectbox("Item 2", opts2, key="d_i2")
-            with c3:
-                opts3 = inv_items if allow_dupes else [x for x in inv_items if x not in {i1, i2}]
-                i3 = st.selectbox("Item 3", opts3, key="d_i3")
+def gathering_xp_for_item(item_name: str) -> int:
+    # XP roughly = tier (simple)
+    return max(1, _tier_from_name(item_name) or 1)
 
-            roll_total = st.number_input("Discovery roll total", min_value=0, max_value=100, value=10, step=1, key="d_roll")
 
-            if st.button("🧩 Try Combination"):
-                prev = crafting.discovery_attempt_preview(sb, player_id, disc_prof, i1, i2, i3, int(roll_total))
-                # Consume immediately
-                crafting.apply_discovery_attempt(sb, player_id, prev)
+def roll_gathering_preview(sb, player_id: str, profession: str, roll_total: int) -> Dict[str, Any]:
+    prog = ensure_player_progress(sb, player_id)
+    skill = (prog.get("skills") or {}).get(profession) or {"level": 1, "xp": 0}
+    level = int(skill.get("level", 1))
+    unlocked = max_tier_for_level(sb, level)
 
-                st.markdown(f"### Result: **{prev['outcome'].upper()}**")
-                if prev.get("hint"):
-                    st.info(prev["hint"])
-                if prev.get("learned_recipe"):
-                    st.success(f"Discovered: **{prev['learned_recipe']}**")
+    target = gathered_tier_from_roll(unlocked, int(roll_total))
+    if target is None:
+        return {"failed": True, "profession": profession, "roll_total": int(roll_total), "unlocked_tier": unlocked}
 
-                st.rerun()
+    target = _clamp(int(target), 1, unlocked + 2)
+    dc = dc_for_target_tier(unlocked, target)
 
-# -------------------------
-# Craft: show tier + components + filters
-# -------------------------
-with tab_craft:
-    st.subheader("🛠️ Crafting (Known Recipes)")
+    found = choose_random_gather_item(sb, profession, target)
+    if not found:
+        return {"failed": True, "profession": profession, "roll_total": int(roll_total), "unlocked_tier": unlocked}
 
-    known = crafting.list_known_recipes_for_player(sb, player_id)
-    all_recipes = crafting.list_all_recipes(sb)
-    rec_by_name = {r["name"]: r for r in all_recipes if r.get("name")}
-    known_rows = [rec_by_name[n] for n in known if n in rec_by_name]
+    xp_gain = gathering_xp_for_item(found.get("name", ""))
 
-    if not known_rows:
-        st.caption("No known recipes yet. Use Recipes (Discovery) to learn them.")
-    else:
-        f1, f2, f3 = st.columns([0.35, 0.20, 0.45])
-        with f1:
-            prof_filter = st.selectbox("Profession", ["All"] + sorted({r["profession"] for r in known_rows}), key="c_prof_f")
-        with f2:
-            tier_filter = st.selectbox("Tier", ["All"] + [f"T{i}" for i in range(1, 8)], key="c_tier_f")
-        with f3:
-            search = st.text_input("Search", "", key="c_search")
+    return {
+        "failed": False,
+        "profession": profession,
+        "roll_total": int(roll_total),
+        "unlocked_tier": unlocked,
+        "tier": int(target),
+        "dc": int(dc),
+        "item_name": found.get("name", ""),
+        "description": found.get("description", "") or "",
+        "use": found.get("use", "") or "",
+        "xp_gain": int(xp_gain),
+    }
 
-        def _ok(r):
-            if prof_filter != "All" and r.get("profession") != prof_filter:
-                return False
-            if tier_filter != "All" and int(r.get("tier", 1)) != int(tier_filter[1:]):
-                return False
-            if search and search.lower() not in r.get("name", "").lower():
-                return False
+
+def apply_gather_result(sb, player_id: str, preview: Dict[str, Any]) -> None:
+    inventory_adjust(sb, player_id, preview["item_name"], +1)
+    set_skill_xp_delta(sb, player_id, preview["profession"], int(preview.get("xp_gain", 1)))
+    log(sb, player_id, "gather", f"Gathered {preview['item_name']}", preview)
+
+
+# ---------------------------
+# Recipes / Discovery
+# ---------------------------
+
+def list_all_recipes(sb) -> List[Dict[str, Any]]:
+    r = sb.table("recipes").select(
+        "name,profession,tier,rarity,category,craft_type,description,use,output_qty,base_price_gp,vendor_price_gp,sale_price_gp,components"
+    ).execute()
+    return r.data or []
+
+
+def list_known_recipes_for_player(sb, player_id: str) -> List[str]:
+    prog = ensure_player_progress(sb, player_id)
+    known = prog.get("known_recipes") or prog.get("discovered_recipes") or []
+    out = []
+    seen = set()
+    for x in known:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+
+def _set_known_recipes(sb, player_id: str, known: List[str]) -> None:
+    # store in both fields if present
+    try:
+        sb.table("player_progress").update({"known_recipes": known, "discovered_recipes": known}).eq("player_id", player_id).execute()
+    except Exception:
+        sb.table("player_progress").update({"known_recipes": known}).eq("player_id", player_id).execute()
+
+
+def profession_allows_duplicate_components(sb, profession: str) -> bool:
+    r = sb.table("recipes").select("components").eq("profession", profession).execute()
+    for row in (r.data or []):
+        comps = _safe_json(row.get("components"))
+        names = [c.get("name") for c in comps if c.get("name")]
+        if len(names) != len(set(names)):
             return True
+    return False
 
-        filtered = sorted([r for r in known_rows if _ok(r)], key=lambda x: (int(x.get("tier", 1)), x.get("name", "").lower()))
-        if not filtered:
-            st.caption("No matching recipes.")
+
+def discovery_attempt_preview(sb, player_id: str, profession: str, item1: str, item2: str, item3: str, roll_total: int) -> Dict[str, Any]:
+    chosen = [item1, item2, item3]
+    chosen_base = sorted([_base_name(x) for x in chosen])
+
+    recs = sb.table("recipes").select("name,tier,profession,components").eq("profession", profession).execute().data or []
+
+    match = None
+    best_overlap = 0
+    best_recipe = None
+
+    for r in recs:
+        comps = _safe_json(r.get("components"))
+        comp_names = sorted([_base_name(c.get("name", "")) for c in comps])
+        overlap = len(set(chosen_base).intersection(set(comp_names)))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_recipe = r
+        if comp_names == chosen_base:
+            match = r
+            break
+
+    prog = ensure_player_progress(sb, player_id)
+    skill = (prog.get("skills") or {}).get(profession) or {"level": 1, "xp": 0}
+    level = int(skill.get("level", 1))
+    unlocked = max_tier_for_level(sb, level)
+    tier_cap = unlocked + 2
+
+    learned_recipe = None
+    outcome = "fail"
+    hint = None
+
+    if match:
+        tier = int(match.get("tier", 1))
+        if tier > tier_cap:
+            outcome = "fail"
+            hint = f"This recipe feels beyond your current mastery (cap T{tier_cap})."
         else:
-            recipe_name = st.selectbox("Select recipe", [r["name"] for r in filtered], key="craft_pick")
-            prev = crafting.craft_preview(sb, player_id, recipe_name)
-
-            st.markdown(f"**Tier:** T{prev['tier']}  |  **Profession:** {prev['profession']}")
-            st.markdown("**Components required:**")
-            for c in prev["components"]:
-                st.write(f"- {c.get('name')} x{int(c.get('qty', 1))}")
-
-            if prev["can_craft"]:
-                st.success("All components available.")
+            dc = dc_for_target_tier(unlocked, tier)
+            if int(roll_total) >= dc:
+                outcome = "success"
+                learned_recipe = match["name"]
             else:
-                st.error("Missing components:")
-                for m in prev["missing"]:
-                    st.write(f"- {m}")
-
-            if st.button("⏳ Start Crafting Timer", disabled=not prev["can_craft"]):
-                crafting.start_craft_job(sb, player_id, prev)
-                st.rerun()
-
-# -------------------------
-# Vendor: 0–3 items, weighted, never above tier cap
-# -------------------------
-with tab_vendor:
-    st.subheader("🧾 Vendor")
-
-    all_recipes = crafting.list_all_recipes(sb)
-    craft_profs = sorted({r["profession"] for r in all_recipes if r.get("profession")})
-    if not craft_profs:
-        st.info("No crafting professions detected from recipes table.")
+                outcome = "fail"
+                hint = "The pattern is real, but the execution was lacking."
     else:
-        shop_prof = st.selectbox("Shop profession", craft_profs, key="shop_prof")
-
-        if st.button("🎲 Generate/Refresh Vendor Stock (this week)"):
-            crafting.refresh_vendor_stock_for_player(sb, player_id, week, shop_prof)
-            st.rerun()
-
-        stock = crafting.get_vendor_stock(sb, player_id, week, shop_prof)
-        if not stock:
-            st.caption("No vendor stock yet. Click refresh.")
+        if best_overlap >= 2 and int(roll_total) >= 18 and best_recipe:
+            outcome = "partial_hint"
+            comps = _safe_json(best_recipe.get("components"))
+            comp_set = set([_base_name(c.get("name", "")) for c in comps])
+            good = [x for x in chosen_base if x in comp_set]
+            if len(good) >= 2:
+                hint = f"Two components resonate together: **{good[0]}** and **{good[1]}**. The third is wrong."
+            else:
+                hint = "Some pieces feel close, but the pattern slips away."
         else:
-            offers = stock.get("offers") or []
-            if not offers:
-                st.caption("No offers today.")
-            else:
-                for off in offers:
-                    name = off["item_name"]
-                    qty = int(off["qty"])
-                    price = off.get("price_gp", None)
+            hint = "Nothing clicks. Maybe try a different combination."
 
-                    c1, c2, c3, c4 = st.columns([0.50, 0.15, 0.15, 0.20])
-                    with c1:
-                        st.write(f"**{name}**")
-                    with c2:
-                        st.write(f"Qty: {qty}")
-                    with c3:
-                        st.write(f"Price: {price if price is not None else '—'}")
-                    with c4:
-                        buy_qty = st.number_input("Buy qty", min_value=1, max_value=qty, value=1, step=1, key=f"buy_{name}")
-                        if st.button("Buy", key=f"buybtn_{name}"):
-                            crafting.vendor_buy(sb, player_id, week, shop_prof, name, int(buy_qty))
-                            st.rerun()
+    xp_gain = 3 if outcome == "success" else 1
 
-# -------------------------
-# Jobs: timers based on your schema (ends_at, done)
-# -------------------------
-with tab_jobs:
-    st.subheader("⏱️ Jobs (Timers)")
+    return {
+        "profession": profession,
+        "roll_total": int(roll_total),
+        "items": chosen,
+        "outcome": outcome,
+        "hint": hint,
+        "learned_recipe": learned_recipe,
+        "xp_gain": int(xp_gain),
+    }
 
-    jobs = crafting.list_active_jobs(sb, player_id)
-    if not jobs:
-        st.caption("No active jobs.")
+
+def apply_discovery_attempt(sb, player_id: str, preview: Dict[str, Any]) -> None:
+    # consume immediately
+    for it in preview["items"]:
+        inventory_adjust(sb, player_id, it, -1)
+
+    set_skill_xp_delta(sb, player_id, preview["profession"], int(preview.get("xp_gain", 1)))
+
+    if preview.get("learned_recipe"):
+        known = list_known_recipes_for_player(sb, player_id)
+        if preview["learned_recipe"] not in known:
+            known.append(preview["learned_recipe"])
+            _set_known_recipes(sb, player_id, known)
+        log(sb, player_id, "discover", f"Discovered recipe: {preview['learned_recipe']}", preview)
     else:
-        now = datetime.now(timezone.utc)
-        for j in jobs:
-            ends_at = j.get("ends_at") or j.get("completes_at")
-            started_at = j.get("started_at") or j.get("created_at")
-            dur = int(j.get("duration_seconds") or 1)
+        log(sb, player_id, "discover", f"Discovery attempt: {preview['outcome']}", preview)
 
-            ends_dt = datetime.fromisoformat(str(ends_at).replace("Z", "+00:00")) if ends_at else now
-            start_dt = datetime.fromisoformat(str(started_at).replace("Z", "+00:00")) if started_at else now
 
-            elapsed = max(0, int((now - start_dt).total_seconds()))
-            pct = min(1.0, elapsed / max(1, dur))
+# ---------------------------
+# Crafting
+# ---------------------------
 
-            st.write(f"**{j.get('recipe_name') or 'Craft job'}**")
-            st.progress(pct)
+def craft_preview(sb, player_id: str, recipe_name: str) -> Dict[str, Any]:
+    r = sb.table("recipes").select("name,tier,profession,components,output_qty").eq("name", recipe_name).limit(1).execute()
+    if not r.data:
+        return {"can_craft": False, "missing": ["Recipe not found"], "tier": 1, "components": []}
 
-            if now >= ends_dt:
-                if st.button("Claim rewards", key=f"claim_{j['id']}"):
-                    crafting.claim_job_rewards(sb, player_id, j["id"])
-                    st.rerun()
+    rec = r.data[0]
+    comps = _safe_json(rec.get("components"))
+
+    inv_map = {x["item_name"]: int(x["quantity"]) for x in list_inventory(sb, player_id)}
+
+    missing = []
+    for c in comps:
+        nm = c.get("name")
+        q = int(c.get("qty", 1))
+        if inv_map.get(nm, 0) < q:
+            missing.append(f"{nm} x{q} (have {inv_map.get(nm, 0)})")
+
+    return {
+        "recipe_name": recipe_name,
+        "tier": int(rec.get("tier", 1)),
+        "profession": rec.get("profession"),
+        "components": comps,
+        "output_qty": int(rec.get("output_qty", 1) or 1),
+        "can_craft": len(missing) == 0,
+        "missing": missing,
+    }
+
+
+def _craft_duration_seconds(tier: int) -> int:
+    # your rule: T6 = 2 hours, others tier*10min
+    if int(tier) == 6:
+        return 2 * 60 * 60
+    return int(tier) * 10 * 60
+
+
+def start_craft_job(sb, player_id: str, preview: Dict[str, Any]) -> None:
+    # consume components
+    for c in preview["components"]:
+        inventory_adjust(sb, player_id, c.get("name"), -int(c.get("qty", 1)))
+
+    tier = int(preview.get("tier", 1))
+    dur = _craft_duration_seconds(tier)
+    ends = _now_utc() + timedelta(seconds=dur)
+
+    payload = {
+        "tier": tier,
+        "profession": preview.get("profession"),
+        "components": preview.get("components"),
+        "output_qty": preview.get("output_qty", 1),
+    }
+
+    # IMPORTANT: match your existing schema:
+    # id, player_id, job_type, ends_at, payload, done, created_at
+    # plus (optional) status/kind/recipe_name/duration_seconds/started_at/completes_at/detail/result
+    base_insert = {
+        "player_id": player_id,
+        "job_type": "craft",
+        "ends_at": ends.isoformat(),
+        "payload": payload,
+        "done": False,
+    }
+
+    # Try insert with extended columns too (if available) but tolerate older caches
+    try:
+        sb.table("crafting_jobs").insert({
+            **base_insert,
+            "status": "active",
+            "kind": "craft",
+            "recipe_name": preview.get("recipe_name"),
+            "duration_seconds": dur,
+            "started_at": _now_utc().isoformat(),
+            "completes_at": ends.isoformat(),
+            "detail": {"tier": tier, "profession": preview.get("profession")},
+            "result": {"output_qty": preview.get("output_qty", 1)},
+        }).execute()
+    except Exception:
+        sb.table("crafting_jobs").insert(base_insert).execute()
+
+    log(sb, player_id, "craft", f"Started crafting: {preview.get('recipe_name')}", {"tier": tier, "ends_at": ends.isoformat()})
+
+
+def list_active_jobs(sb, player_id: str) -> List[Dict[str, Any]]:
+    # active = not done; also support status='active' if used
+    try:
+        r = sb.table("crafting_jobs").select("*").eq("player_id", player_id).eq("done", False).order("created_at", desc=True).execute()
+        return r.data or []
+    except Exception:
+        try:
+            r = sb.table("crafting_jobs").select("*").eq("player_id", player_id).eq("status", "active").order("created_at", desc=True).execute()
+            return r.data or []
+        except Exception:
+            return []
+
+
+def claim_job_rewards(sb, player_id: str, job_id: str) -> None:
+    job = sb.table("crafting_jobs").select("*").eq("id", job_id).single().execute().data
+    if not job:
+        return
+
+    ends_at = job.get("ends_at") or job.get("completes_at")
+    if not ends_at:
+        return
+
+    ends_dt = datetime.fromisoformat(str(ends_at).replace("Z", "+00:00"))
+    if _now_utc() < ends_dt:
+        return
+
+    payload = job.get("payload") or job.get("detail") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+
+    recipe_name = job.get("recipe_name") or payload.get("recipe_name") or payload.get("name")
+    output_qty = int(payload.get("output_qty", 1))
+
+    if recipe_name:
+        inventory_adjust(sb, player_id, recipe_name, +output_qty)
+        prof = payload.get("profession")
+        tier = int(payload.get("tier", 1))
+        if prof:
+            set_skill_xp_delta(sb, player_id, prof, max(1, tier + 1))
+        log(sb, player_id, "craft", f"Craft completed: {recipe_name}", {"qty": output_qty})
+
+    # mark done
+    try:
+        sb.table("crafting_jobs").update({"done": True, "status": "completed"}).eq("id", job_id).execute()
+    except Exception:
+        sb.table("crafting_jobs").update({"done": True}).eq("id", job_id).execute()
+
+
+# ---------------------------
+# Vendor
+# ---------------------------
+
+def _vendor_price_for_item(sb, item_name: str) -> float:
+    r = sb.table("gathering_items").select("vendor_price_gp").eq("name", item_name).limit(1).execute()
+    if r.data:
+        try:
+            return float(r.data[0].get("vendor_price_gp") or 0)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def refresh_vendor_stock_for_player(sb, player_id: str, week: int, shop_profession: str) -> None:
+    # pool = components used by recipes of that profession
+    recs = sb.table("recipes").select("components").eq("profession", shop_profession).execute().data or []
+    comp_names = set()
+    for r in recs:
+        comps = _safe_json(r.get("components"))
+        for c in comps:
+            nm = c.get("name")
+            if nm:
+                comp_names.add(nm)
+
+    comp_names = list(comp_names)
+    offers: List[Dict[str, Any]] = []
+
+    # 20% chance of no offers
+    if comp_names and random.random() >= 0.20:
+        prog = ensure_player_progress(sb, player_id)
+        skill = (prog.get("skills") or {}).get(shop_profession) or {"level": 1, "xp": 0}
+        unlocked = max_tier_for_level(sb, int(skill.get("level", 1)))
+        cap = unlocked + 2
+
+        # 0–3 items per visit (we do 1–3 when offers happen)
+        line_count = random.choices([1, 2, 3], weights=[50, 35, 15], k=1)[0]
+
+        def pick_tier():
+            # 50% tier X, 20% X+1, 10% X+2 (remaining 20% already used for "no offers")
+            return random.choices([unlocked, unlocked + 1, unlocked + 2], weights=[50, 20, 10], k=1)[0]
+
+        def pick_qty():
+            return random.choices([1, 2, 3], weights=[50, 35, 15], k=1)[0]
+
+        used = set()
+        tries = 0
+        while len(offers) < line_count and tries < 200:
+            tries += 1
+            nm = random.choice(comp_names)
+            if nm in used:
+                continue
+            t = _tier_from_name(nm) or 1
+            target_t = pick_tier()
+            if t != target_t:
+                continue
+            if t > cap:
+                continue
+            used.add(nm)
+            offers.append({
+                "item_name": nm,
+                "qty": pick_qty(),
+                "price_gp": _vendor_price_for_item(sb, nm),
+            })
+
+    # upsert stock
+    sb.table("vendor_stock").upsert({
+        "player_id": player_id,
+        "week": int(week),
+        "shop_profession": shop_profession,
+        "offers": offers
+    }).execute()
+
+    log(sb, player_id, "vendor", f"Vendor refreshed: {shop_profession} week {week}", {"offers": offers})
+
+
+def get_vendor_stock(sb, player_id: str, week: int, shop_profession: str) -> Optional[Dict[str, Any]]:
+    r = sb.table("vendor_stock").select("offers").eq("player_id", player_id).eq("week", int(week)).eq("shop_profession", shop_profession).limit(1).execute()
+    return r.data[0] if r.data else None
+
+
+def vendor_buy(sb, player_id: str, week: int, shop_profession: str, item_name: str, qty: int) -> None:
+    qty = int(qty)
+    if qty <= 0:
+        return
+
+    row = get_vendor_stock(sb, player_id, week, shop_profession)
+    if not row:
+        return
+
+    offers = row.get("offers") or []
+    new_offers = []
+    bought = 0
+
+    for o in offers:
+        if o.get("item_name") == item_name and bought == 0:
+            have = int(o.get("qty", 0))
+            take = min(have, qty)
+            if take > 0:
+                inventory_adjust(sb, player_id, item_name, +take)
+                bought = take
+                remain = have - take
+                if remain > 0:
+                    o["qty"] = remain
+                    new_offers.append(o)
             else:
-                st.caption(f"Ends at: {ends_dt}")
+                new_offers.append(o)
+        else:
+            new_offers.append(o)
+
+    sb.table("vendor_stock").update({"offers": new_offers}).eq("player_id", player_id).eq("week", int(week)).eq("shop_profession", shop_profession).execute()
+
+    if bought:
+        log(sb, player_id, "vendor", f"Bought {bought} x {item_name}", {"qty": bought})
