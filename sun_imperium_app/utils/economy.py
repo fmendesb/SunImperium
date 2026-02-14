@@ -3,6 +3,8 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+import re
+
 # --- Canonical Week-1 constants (from DM) ---
 GRAIN_PER_CAPITA = 0.006  # 2700 / 450_000
 WATER_PER_CAPITA = 0.004  # 1800 / 450_000
@@ -27,38 +29,6 @@ class WeekEconomyResult:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
-
-
-def _normalize_price_gp(price: float, *, tier: int | None = None, rarity: str | None = None) -> float:
-    """Best-effort normalization for item prices.
-
-    Prices in `gathering_items` are intended to be stored in **gp**.
-    In practice, some imports accidentally store gp values multiplied by 10,000
-    (treating gp as if it were copper). That yields absurd prices (eg ~13,000gp
-    for a T1 material) and then our demand model collapses quantities to 0.
-
-    Heuristic: if the price is *very* large for low tiers, assume it's scaled
-    by 10,000 and convert it back.
-    """
-
-    try:
-        p = float(price or 0)
-    except Exception:
-        return 0.0
-
-    if p <= 0:
-        return 0.0
-
-    t = int(tier) if tier is not None and str(tier).strip() != "" else None
-    r = (rarity or "").strip().lower()
-
-    # Low-tier / common items should never be in the thousands of gp.
-    if p >= 1000:
-        if (t is not None and t <= 3) or (r in {"common", "uncommon", ""}):
-            p = p / 10000.0
-
-    # Guard against negative / nonsense.
-    return max(0.0, p)
 
 
 def _stable_seed(week: int, key: str) -> int:
@@ -230,10 +200,79 @@ def _infer_family_from_region(week: int, item_name: str, region: str) -> str:
     if "new triport" in r or "triport" in r:
         return "lathien"
     if "moonglade" in r:
-        choices = ["eladrin", "elenwe", "galadhel"]
+        # deterministic pick so it doesn't reshuffle every rerun
+        choices = ["galadhel", "elenwe", "eladrin"]
         h = hashlib.sha256(f"{week}:{item_name}:{region}".encode("utf-8")).hexdigest()
         return choices[int(h[:2], 16) % len(choices)]
     return ""
+
+
+def _parse_tier(name: str, fallback: int | None = None) -> int:
+    """Extract tier from item name like "Foo (T3)"."""
+    m = re.search(r"\(\s*T\s*(\d+)\s*\)", name, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    if fallback is not None:
+        try:
+            return int(fallback)
+        except Exception:
+            pass
+    return 1
+
+
+def _tier_price_cap_gp(tier: int) -> float:
+    """Absolute sanity cap for *effective* prices.
+
+    We want higher prices during war, but not so extreme that quantities become 0 everywhere.
+    Caps are deliberately generous for high tiers.
+    """
+    tier = max(1, min(10, int(tier)))
+    return {
+        1: 50.0,
+        2: 120.0,
+        3: 250.0,
+        4: 600.0,
+        5: 1500.0,
+        6: 4000.0,
+        7: 12000.0,
+        8: 25000.0,
+        9: 40000.0,
+        10: 60000.0,
+    }[tier]
+
+
+def _load_reputation_scores(sb, week: int) -> tuple[dict[str, float], dict[str, float]]:
+    """Return (region_scores, family_scores) from the reputation system.
+
+    If you only change reputation (and don't manually touch region_week_state/family_week_state),
+    we still want the economy to respond.
+    """
+    region_scores: dict[str, float] = {}
+    family_scores: dict[str, float] = {}
+    try:
+        fac = sb.table("factions").select("id,name,type").execute().data or []
+        fac_by_id = {f["id"]: f for f in fac if f.get("id")}
+        reps = sb.table("reputation").select("faction_id,score").eq("week", week).execute().data or []
+        for r in reps:
+            fid = r.get("faction_id")
+            f = fac_by_id.get(fid)
+            if not f:
+                continue
+            nm = (f.get("name") or "").strip()
+            tp = (f.get("type") or "").strip().lower()
+            if not nm:
+                continue
+            sc = float(r.get("score") or 0)
+            if tp == "region":
+                region_scores[nm] = sc
+            elif tp == "family":
+                family_scores[nm] = sc
+    except Exception:
+        pass
+    return region_scores, family_scores
 
 
 def _avg_region_production(sb, week: int) -> float:
@@ -254,41 +293,67 @@ def _avg_family_reputation(sb, week: int) -> float:
         return 0.0
 
 
-def region_supply(sb, week: int, region: str) -> float:
-    """Supply factor: higher production_score increases supply."""
-    r = (
-        sb.table("region_week_state")
-        .select("production_score,dm_modifier")
-        .eq("week", week)
-        .eq("region", region)
-        .limit(1)
-        .execute()
-    )
-    if not r.data:
-        return 1.0
-    row = r.data[0]
-    ps = float(row.get("production_score") or 0)
-    dm = float(row.get("dm_modifier") or 0)
-    supply = 1.0 + (ps * 0.08) + dm
+def region_supply(sb, week: int, region: str, rep_scores: dict[str, float] | None = None) -> float:
+    """Supply factor for a region.
+
+    Priority:
+    1) region_week_state (explicit DM knobs)
+    2) reputation score for that region (automatic linkage)
+    """
+    try:
+        r = (
+            sb.table("region_week_state")
+            .select("production_score,dm_modifier")
+            .eq("week", week)
+            .eq("region", region)
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            row = r.data[0]
+            ps = float(row.get("production_score") or 0)
+            dm = float(row.get("dm_modifier") or 0)
+            supply = 1.0 + (ps * 0.08) + dm
+            return _clamp(supply, 0.50, 2.00)
+    except Exception:
+        pass
+
+    sc = 0.0
+    if rep_scores is not None:
+        sc = float(rep_scores.get(region, 0.0) or 0.0)
+    supply = 1.0 + (sc * 0.03)
     return _clamp(supply, 0.50, 2.00)
 
 
-def family_supply(sb, week: int, family: str) -> float:
-    """Supply factor: higher family reputation increases reliability and trade access."""
-    r = (
-        sb.table("family_week_state")
-        .select("reputation_score,dm_modifier")
-        .eq("week", week)
-        .eq("family", family)
-        .limit(1)
-        .execute()
-    )
-    if not r.data:
-        return 1.0
-    row = r.data[0]
-    rep = float(row.get("reputation_score") or 0)
-    dm = float(row.get("dm_modifier") or 0)
-    supply = 1.0 + (rep * 0.06) + dm
+def family_supply(sb, week: int, family: str, rep_scores: dict[str, float] | None = None) -> float:
+    """Supply factor for a family.
+
+    Priority:
+    1) family_week_state (explicit DM knobs)
+    2) reputation score for that family (automatic linkage)
+    """
+    try:
+        r = (
+            sb.table("family_week_state")
+            .select("reputation_score,dm_modifier")
+            .eq("week", week)
+            .eq("family", family)
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            row = r.data[0]
+            rep = float(row.get("reputation_score") or 0)
+            dm = float(row.get("dm_modifier") or 0)
+            supply = 1.0 + (rep * 0.06) + dm
+            return _clamp(supply, 0.50, 2.00)
+    except Exception:
+        pass
+
+    sc = 0.0
+    if rep_scores is not None:
+        sc = float(rep_scores.get(family, 0.0) or 0.0)
+    supply = 1.0 + (sc * 0.06)
     return _clamp(supply, 0.50, 2.00)
 
 
@@ -374,6 +439,10 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
 
     rand_min, rand_max = settings["rand_min"], settings["rand_max"]
 
+    # Reputation linkage: if you bump reputation scores, economy should respond
+    # even if region_week_state / family_week_state aren't manually populated.
+    region_rep, family_rep = _load_reputation_scores(sb, week)
+
     raw_items = (
         sb.table("gathering_items")
         .select("name,tier,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family")
@@ -389,7 +458,7 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
         if not name:
             continue
 
-        tier = int(it.get("tier") or 1)
+        tier = _parse_tier(name, it.get("tier"))
         rarity = (it.get("rarity") or "Common").strip() or "Common"
         region = (it.get("region") or "").strip()
         family = (it.get("family") or "").strip()
@@ -398,15 +467,18 @@ def compute_week_economy(sb, week: int) -> Tuple[WeekEconomyResult, List[Dict[st
             family = _infer_family_from_region(week, name, region)
 
         price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
-        base_price = _normalize_price_gp(float(price or 0), tier=tier, rarity=rarity)
+        base_price = float(price or 0)
 
         # Supply improvements lower prices.
-        rs = region_supply(sb, week, region) if region else 1.0
-        fs = family_supply(sb, week, family) if family else 1.0
+        rs = region_supply(sb, week, region, rep_scores=region_rep) if region else 1.0
+        fs = family_supply(sb, week, family, rep_scores=family_rep) if family else 1.0
         supply = _clamp(rs * fs, 0.25, 3.0)
 
         effective_price = base_price * scarcity_mult / supply
         effective_price = max(0.0001, float(effective_price))
+
+        # Price sanity cap so low tiers don't explode into absurd values.
+        effective_price = min(effective_price, _tier_price_cap_gp(tier))
 
         # Demand weight: mostly tier/rarity driven
         w = _tier_weight(tier, rarity)
