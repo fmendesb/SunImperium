@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
+import re
 
 from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week, compute_totals, add_ledger_entry
 from utils.undo import log_action, get_last_action, pop_last_action
-from utils.squads import detect_member_caps, fetch_members, bulk_add_members
 
 UNDO_CATEGORY = "moonblade"
 
@@ -199,18 +199,65 @@ with tab_squads:
         mission = st.text_input("Mission (optional)", placeholder="Patrol / Escort / Siege...")
         if st.form_submit_button("Create squad"):
             if squad_name.strip():
-                payload = {"name": squad_name.strip(), "region": region.strip() or None}
-                # optional newer fields
-                payload["destination"] = destination.strip() or None
-                payload["mission"] = mission.strip() or None
-                payload["status"] = "ready"
-                payload["deployed_week"] = None
-                payload["is_enemy"] = False
-                try:
-                    sb.table("squads").insert(payload).execute()
-                except Exception:
-                    # fallback: only the old columns exist
-                    sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip() or None}).execute()
+                # Robust insert: some schemas have extra NOT NULL columns (week/owner/type/etc.)
+                def _infer_missing_notnull_column(err: Exception) -> str | None:
+                    txt = str(err)
+                    m = re.search(r'null value in column "([^"]+)"', txt)
+                    return m.group(1) if m else None
+
+                def _default_for_col(col: str) -> object:
+                    c = col.lower()
+                    if c in {"week", "created_week", "start_week"}:
+                        return int(week)
+                    if c in {"deployed_week"}:
+                        return None
+                    if c in {"is_enemy"}:
+                        return False
+                    if c in {"status"}:
+                        return "ready"
+                    if c in {"side", "squad_side", "type", "squad_type"}:
+                        return "ally"
+                    if c in {"owner", "created_by"}:
+                        return "players"
+                    if c in {"destination", "mission", "region"}:
+                        return None
+                    return None
+
+                base_payload = {
+                    "name": squad_name.strip(),
+                    "region": region.strip() or None,
+                    "destination": destination.strip() or None,
+                    "mission": mission.strip() or None,
+                    "status": "ready",
+                    "deployed_week": None,
+                    "is_enemy": False,
+                }
+
+                payload = dict(base_payload)
+                last_err: Exception | None = None
+                for _ in range(6):
+                    try:
+                        sb.table("squads").insert(payload).execute()
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        missing = _infer_missing_notnull_column(e)
+                        if missing and missing not in payload:
+                            payload[missing] = _default_for_col(missing)
+                            continue
+                        # Legacy fallback: old schemas only have name/region
+                        try:
+                            sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip() or None}).execute()
+                            last_err = None
+                        except Exception as e2:
+                            last_err = e2
+                        break
+
+                if last_err:
+                    st.error(f"Could not create squad: {last_err}")
+                    st.stop()
+
                 st.success("Squad created.")
                 st.rerun()
 
@@ -222,10 +269,31 @@ with tab_squads:
     label = st.selectbox("Select squad", list(squad_options.keys()), key="squad_select")
     squad = squad_options[label]
 
-    # Load squad members (schema-tolerant)
-    caps = detect_member_caps(sb)
-    UNIT_TYPE_BY_ID = {u.get("id"): (u.get("unit_type") or "Other") for u in units}
-    members, _caps = fetch_members(sb, squad["id"], unit_type_by_id=UNIT_TYPE_BY_ID, _caps=caps)
+    # Load members (be defensive: older schemas may not have unit_type yet)
+    try:
+        members = (
+            sb.table("squad_members")
+            .select("id,unit_id,unit_type,quantity")
+            .eq("squad_id", squad["id"])
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        # Fallback: only unit_id/quantity exist.
+        members = (
+            sb.table("squad_members")
+            .select("id,unit_id,quantity")
+            .eq("squad_id", squad["id"])
+            .execute()
+            .data
+            or []
+        )
+        # Backfill unit_type from unit catalog so the UI + war sim stay consistent.
+        for m in members:
+            uid = m.get("unit_id")
+            u = unit_by_id.get(uid) if uid else None
+            m["unit_type"] = (u.get("unit_type") if u else None) or "Other"
 
     def compute_squad_power(ms: list[dict]) -> float:
         power_total = 0.0
@@ -292,61 +360,54 @@ with tab_squads:
     if not owned_units:
         st.info("Recruit units first.")
     else:
-        st.caption("Tip: enter quantities for multiple units, then click **Add selected** once.")
+        owned_types = sorted({(u.get("unit_type") or "Other").strip() for u in owned_units})
+        cA, cB = st.columns([2, 3])
+        with cA:
+            assign_type = st.selectbox("Unit type", ["All"] + owned_types, key="assign_type")
+        with cB:
+            candidates = [u for u in owned_units if assign_type == "All" or (u.get("unit_type") or "Other").strip() == assign_type]
+            pick = st.selectbox(
+                "Unit",
+                [f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates],
+                key="assign_unit",
+            )
 
-        df = pd.DataFrame(
-            [
-                {
-                    "Unit": u.get("name"),
-                    "Type": (u.get("unit_type") or "Other"),
-                    "Owned": int(roster_map.get(u["id"], 0)),
-                    "Power": float(u.get("power") or 0),
-                    "Add": 0,
-                    "_unit_id": u["id"],
-                }
-                for u in owned_units
-            ]
-        )
+        chosen = candidates[[f"{u['name']} ({u.get('unit_type') or 'Other'})" for u in candidates].index(pick)]
+        max_add = roster_map.get(chosen["id"], 0)
+        qty_add = st.number_input("Add qty", min_value=1, max_value=max_add, value=1, key="assign_qty")
 
-        # show user-facing table only
-        view = df[["Unit", "Type", "Owned", "Power", "Add"]]
-        edited = st.data_editor(
-            view,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Owned": st.column_config.NumberColumn(disabled=True),
-                "Power": st.column_config.NumberColumn(disabled=True),
-                "Add": st.column_config.NumberColumn(min_value=0, step=1),
-            },
-            key="squad_add_editor",
-        )
+        if st.button("Add to squad", key="add_to_squad"):
+            # decrement roster
+            sb.table("moonblade_roster").upsert(
+                {"unit_id": chosen["id"], "quantity": max_add - int(qty_add)}
+            ).execute()
 
-        if st.button("Add selected", type="primary"):
-            adds = []
-            for i, row in edited.iterrows():
-                add_qty = int(row.get("Add") or 0)
-                if add_qty <= 0:
-                    continue
-                unit_id = df.iloc[i]["_unit_id"]
-                owned = int(df.iloc[i]["Owned"])
-                if add_qty > owned:
-                    add_qty = owned
-                adds.append(
-                    {
-                        "unit_id": unit_id,
-                        "unit_type": str(df.iloc[i]["Type"]),
-                        "qty": add_qty,
-                    }
-                )
-                # decrement roster
-                sb.table("moonblade_roster").upsert({"unit_id": unit_id, "quantity": owned - add_qty}).execute()
+            # upsert member (best-effort)
+            existing = (
+                sb.table("squad_members")
+                .select("id,quantity")
+                .eq("squad_id", squad["id"])
+                .eq("unit_id", chosen["id"])
+                .limit(1)
+                .execute()
+                .data
+            )
 
-            if adds:
-                bulk_add_members(sb, squad["id"], adds, caps)
-                st.success("Assigned.")
-                st.rerun()
+            if existing:
+                sb.table("squad_members").update(
+                    {"quantity": int(existing[0]["quantity"]) + int(qty_add)}
+                ).eq("id", existing[0]["id"]).execute()
             else:
-                st.info("Nothing to add.")
+                sb.table("squad_members").insert(
+                    {
+                        "squad_id": squad["id"],
+                        "unit_id": chosen["id"],
+                        "unit_type": (chosen.get("unit_type") or "Other"),
+                        "quantity": int(qty_add),
+                    }
+                ).execute()
+
+            st.success("Assigned.")
+            st.rerun()
 
 st.info("War Simulator: pick a friendly squad and an enemy squad (DM-created) to resolve battles.")
