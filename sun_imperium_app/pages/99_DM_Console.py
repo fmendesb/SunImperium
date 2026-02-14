@@ -176,20 +176,9 @@ with reps_tab:
 
         if st.button("Save reputation visibility", type="primary"):
             try:
-                hidden_list: list[str] = []
                 for i, row in edited_f.iterrows():
                     fid = df_f.iloc[i]["_id"]
-                    is_hidden = bool(row["Hidden from players"])
-                    sb.table("factions").update({"is_hidden": is_hidden }).eq("id", fid).execute()
-                    if is_hidden:
-                        hidden_list.append(str(fid))
-
-                # Backward compatible: some pages read hidden faction ids from app_state
-                # (array column) instead of factions.is_hidden. We write both.
-                try:
-                    sb.table("app_state").upsert({"id": 1, "ui_hidden_factions": hidden_list}).execute()
-                except Exception:
-                    pass
+                    sb.table("factions").update({"is_hidden": bool(row["Hidden from players"]) }).eq("id", fid).execute()
                 st.success("Saved.")
                 st.rerun()
             except Exception as e:
@@ -362,11 +351,38 @@ with week_tab:
 
         set_current_week(sb, next_week)
 
-        # Carry forward population (survival can reduce it)
+        # Carry forward population (GENTLE changes)
         try:
             pop_now = int(getattr(summary, "population", 450_000) or 450_000)
             surv = float(getattr(summary, "survival_ratio", 1.0) or 1.0)
-            pop_next = max(0, int(round(pop_now * surv)))
+
+            deficit = max(0.0, 1.0 - surv)
+            surplus = max(0.0, surv - 1.0)
+
+            # 74% shortfall -> ~3.7% loss (deficit/20)
+            delta = (-deficit / 20.0) + (surplus / 50.0)
+            delta = max(-0.05, min(0.02, delta))
+
+            pop_next = int(round(pop_now * (1.0 + delta)))
+
+            # War casualties: gentle additional loss, capped to 1% of pop/week
+            try:
+                wars = sb.table("wars").select("result").eq("week", week).execute().data or []
+                casualties = 0
+                for w in wars:
+                    res = w.get("result") or {}
+                    ally = res.get("ally_casualties") or {}
+                    if isinstance(ally, dict):
+                        if "total" in ally:
+                            casualties += int(ally.get("total") or 0)
+                        else:
+                            casualties += sum(int(v or 0) for v in ally.values() if isinstance(v, (int, float)))
+                if casualties > 0:
+                    pop_next = max(0, pop_next - min(int(pop_now * 0.01), casualties))
+            except Exception:
+                pass
+
+            pop_next = max(0, pop_next)
             sb.table("population_state").upsert({"week": next_week, "population": pop_next}, on_conflict="week").execute()
         except Exception:
             pass
