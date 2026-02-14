@@ -5,30 +5,21 @@ from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
 from utils.state import ensure_bootstrap
 from utils.ledger import get_current_week
-from utils import economy
 
 page_config("Economy", "📊")
 sidebar("📊 Economy")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
-
-current_week = get_current_week(sb)
-# Last computed week is usually current_week - 1
-computed_week = max(1, current_week - 1)
+week = get_current_week(sb)
 
 st.title("📊 Economy")
-st.caption(f"Current week: {current_week} · Showing latest computed economy: Week {computed_week}")
+st.caption(f"Week {week} · Prices, quantities, and who controls what")
 
-# Backfill missing families into gathering_items (best-effort, non-destructive)
-try:
-    economy.backfill_gathering_item_families(sb, week=computed_week)
-except Exception:
-    pass
-
+# Load item catalog
 items = (
     sb.table("gathering_items")
-    .select("name,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family,tier")
+    .select("name,tier,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family")
     .order("tier")
     .order("name")
     .execute()
@@ -36,71 +27,65 @@ items = (
     or []
 )
 
-out_rows = (
+# Load latest computed weekly output (if week hasn't been computed yet, table may be empty)
+out = (
     sb.table("economy_week_output")
-    .select("item_name,qty,effective_price,gross_value,region,family,rarity")
-    .eq("week", computed_week)
+    .select("item_name,qty,effective_price,gross_value,region,family")
+    .eq("week", week)
     .execute()
     .data
     or []
 )
-out_by_name = {r["item_name"]: r for r in out_rows if r.get("item_name")}
-
-def pick_base_price(it: dict) -> float:
-    price = (
-        it.get("base_price_gp")
-        or it.get("vendor_price_gp")
-        or it.get("sale_price_gp")
-        or 0
-    )
-    try:
-        return float(price or 0)
-    except Exception:
-        return 0.0
+by_name = {r.get("item_name"): r for r in out if r.get("item_name")}
 
 rows = []
 for it in items:
     name = (it.get("name") or "").strip()
     if not name:
         continue
-    base_price = pick_base_price(it)
-    out = out_by_name.get(name)
-    cur_price = float(out.get("effective_price")) if out and out.get("effective_price") is not None else base_price
-    qty = int(out.get("qty") or 0) if out else 0
-    region = (out.get("region") if out else it.get("region")) or ""
-    family = (out.get("family") if out else it.get("family")) or ""
+
+    price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
+    base_price = float(price or 0)
+
+    o = by_name.get(name) or {}
+    current_price = float(o.get("effective_price") or 0)
+    qty = int(o.get("qty") or 0)
+
     rows.append(
         {
+            "Tier": int(it.get("tier") or 1),
+            "Rarity": (it.get("rarity") or "Common"),
             "Item": name,
-            "Tier": it.get("tier"),
-            "Rarity": (out.get("rarity") if out else it.get("rarity")) or "",
-            "Region": region,
-            "Family": family,
             "Baseline price (gp)": base_price,
-            "Current price (gp)": float(cur_price),
+            "Current price (gp)": current_price,
             "Weekly qty": qty,
+            "Region": (o.get("region") or it.get("region") or ""),
+            "Family": (o.get("family") or it.get("family") or ""),
         }
     )
 
 df = pd.DataFrame(rows)
-if df.empty:
-    st.info("No gathering items found.")
-else:
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        q = st.text_input("Search", "")
-    with c2:
-        reg = st.selectbox("Region", ["All"] + sorted([r for r in df["Region"].dropna().unique().tolist() if r]))
-    with c3:
-        fam = st.selectbox("Family", ["All"] + sorted([f for f in df["Family"].dropna().unique().tolist() if f]))
 
-    view = df.copy()
-    if q:
-        view = view[view["Item"].str.contains(q, case=False, na=False)]
-    if reg != "All":
-        view = view[view["Region"] == reg]
-    if fam != "All":
-        view = view[view["Family"] == fam]
+# Filters
+c1, c2, c3 = st.columns(3)
+with c1:
+    tier_sel = st.multiselect("Tier", sorted(df["Tier"].unique().tolist()), default=[])
+with c2:
+    rarity_sel = st.multiselect("Rarity", sorted(df["Rarity"].unique().tolist()), default=[])
+with c3:
+    q_only = st.checkbox("Only show traded this week", value=False)
 
-    st.dataframe(view, use_container_width=True, hide_index=True)
-    st.caption("Baseline price comes from gathering_items. Current price/qty come from the latest computed economy_week_output.")
+f = df
+if tier_sel:
+    f = f[f["Tier"].isin(tier_sel)]
+if rarity_sel:
+    f = f[f["Rarity"].isin(rarity_sel)]
+if q_only:
+    f = f[f["Weekly qty"] > 0]
+
+st.dataframe(f, use_container_width=True, hide_index=True)
+
+st.caption(
+    "Tip: Prices and quantities show after the week economy is computed (Advance Week). "
+    "If everything is 0, advance once or check that economy_week_output has rows for this week."
+)
