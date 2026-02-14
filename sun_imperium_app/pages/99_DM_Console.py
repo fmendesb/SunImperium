@@ -306,6 +306,12 @@ with enemy_tab:
                 st.rerun()
 
 # --- Advance week ---
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 with week_tab:
     st.caption("Computes economy, posts payout to the ledger, closes the week, opens next week.")
 
@@ -332,6 +338,36 @@ with week_tab:
                     "manual_adjustment": float(manual_income or 0),
                 },
             )
+
+        # Post infrastructure upkeep (weekly)
+        try:
+            owned = sb.table("infrastructure_owned").select("*").execute().data or []
+            cat = sb.table("infrastructure").select("name,tier,upkeep").execute().data or []
+            upkeep_map = {(c.get("name"), _safe_int(c.get("tier"), 1)): float(c.get("upkeep") or 0) for c in cat}
+
+            upkeep_total = 0.0
+            for o in owned:
+                nm = o.get("name") or o.get("infrastructure_name") or o.get("infra_name")
+                tr = o.get("tier") or o.get("infrastructure_tier") or 1
+                qty = o.get("quantity") or o.get("qty") or 1
+                if not nm:
+                    continue
+                key = (nm, _safe_int(tr, 1))
+                u = float(upkeep_map.get(key, 0) or 0)
+                upkeep_total += u * float(qty or 1)
+
+            if upkeep_total > 0:
+                add_ledger_entry(
+                    sb,
+                    week=week,
+                    direction="out",
+                    amount=upkeep_total,
+                    category="infrastructure_upkeep",
+                    note="Weekly infrastructure upkeep",
+                    metadata={"total_upkeep": upkeep_total},
+                )
+        except Exception:
+            pass
 
         # Close current week
         try:
