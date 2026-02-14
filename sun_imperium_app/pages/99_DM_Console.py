@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
+import re
 
 from utils.nav import page_config, sidebar
 from utils.supabase_client import get_supabase
@@ -235,9 +236,63 @@ with enemy_tab:
                 if not squad_name.strip():
                     st.error("Please enter a name.")
                 else:
-                    sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip(), "is_enemy": True}).execute()
-                    st.success("Enemy squad created.")
-                    st.rerun()
+                    # Robust insert: some schemas have extra NOT NULL columns (week/owner/type/etc.)
+                    def _infer_missing_notnull_column(err: Exception) -> str | None:
+                        txt = str(err)
+                        m = re.search(r'null value in column "([^"]+)"', txt)
+                        return m.group(1) if m else None
+
+                    def _default_for_col(col: str) -> object:
+                        c = col.lower()
+                        if c in {"week", "created_week", "start_week"}:
+                            return int(week)
+                        if c in {"deployed_week"}:
+                            return None
+                        if c in {"is_enemy"}:
+                            return True
+                        if c in {"status"}:
+                            return "ready"
+                        if c in {"side", "squad_side", "type", "squad_type"}:
+                            return "enemy"
+                        if c in {"owner", "created_by"}:
+                            return "dm"
+                        if c in {"destination", "mission", "region"}:
+                            return None
+                        return None
+
+                    payload = {
+                        "name": squad_name.strip(),
+                        "region": region.strip() or None,
+                        "is_enemy": True,
+                        "status": "ready",
+                        "deployed_week": None,
+                    }
+
+                    last_err: Exception | None = None
+                    for _ in range(6):
+                        try:
+                            sb.table("squads").insert(payload).execute()
+                            last_err = None
+                            break
+                        except Exception as e:
+                            last_err = e
+                            missing = _infer_missing_notnull_column(e)
+                            if missing and missing not in payload:
+                                payload[missing] = _default_for_col(missing)
+                                continue
+                            # Legacy fallback
+                            try:
+                                sb.table("squads").insert({"name": squad_name.strip(), "region": region.strip() or None, "is_enemy": True}).execute()
+                                last_err = None
+                            except Exception as e2:
+                                last_err = e2
+                            break
+
+                    if last_err:
+                        st.error(f"Could not create enemy squad: {last_err}")
+                    else:
+                        st.success("Enemy squad created.")
+                        st.rerun()
 
         if not enemy_squads:
             st.info("No enemy squads yet. Create one above.")
@@ -306,12 +361,6 @@ with enemy_tab:
                 st.rerun()
 
 # --- Advance week ---
-def _safe_int(x, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
 with week_tab:
     st.caption("Computes economy, posts payout to the ledger, closes the week, opens next week.")
 
@@ -339,36 +388,6 @@ with week_tab:
                 },
             )
 
-        # Post infrastructure upkeep (weekly)
-        try:
-            owned = sb.table("infrastructure_owned").select("*").execute().data or []
-            cat = sb.table("infrastructure").select("name,tier,upkeep").execute().data or []
-            upkeep_map = {(c.get("name"), _safe_int(c.get("tier"), 1)): float(c.get("upkeep") or 0) for c in cat}
-
-            upkeep_total = 0.0
-            for o in owned:
-                nm = o.get("name") or o.get("infrastructure_name") or o.get("infra_name")
-                tr = o.get("tier") or o.get("infrastructure_tier") or 1
-                qty = o.get("quantity") or o.get("qty") or 1
-                if not nm:
-                    continue
-                key = (nm, _safe_int(tr, 1))
-                u = float(upkeep_map.get(key, 0) or 0)
-                upkeep_total += u * float(qty or 1)
-
-            if upkeep_total > 0:
-                add_ledger_entry(
-                    sb,
-                    week=week,
-                    direction="out",
-                    amount=upkeep_total,
-                    category="infrastructure_upkeep",
-                    note="Weekly infrastructure upkeep",
-                    metadata={"total_upkeep": upkeep_total},
-                )
-        except Exception:
-            pass
-
         # Close current week
         try:
             sb.table("weeks").update({"closed_at": datetime.now(timezone.utc).isoformat()}).eq("week", week).execute()
@@ -387,38 +406,11 @@ with week_tab:
 
         set_current_week(sb, next_week)
 
-        # Carry forward population (GENTLE changes)
+        # Carry forward population (survival can reduce it)
         try:
             pop_now = int(getattr(summary, "population", 450_000) or 450_000)
             surv = float(getattr(summary, "survival_ratio", 1.0) or 1.0)
-
-            deficit = max(0.0, 1.0 - surv)
-            surplus = max(0.0, surv - 1.0)
-
-            # 74% shortfall -> ~3.7% loss (deficit/20)
-            delta = (-deficit / 20.0) + (surplus / 50.0)
-            delta = max(-0.05, min(0.02, delta))
-
-            pop_next = int(round(pop_now * (1.0 + delta)))
-
-            # War casualties: gentle additional loss, capped to 1% of pop/week
-            try:
-                wars = sb.table("wars").select("result").eq("week", week).execute().data or []
-                casualties = 0
-                for w in wars:
-                    res = w.get("result") or {}
-                    ally = res.get("ally_casualties") or {}
-                    if isinstance(ally, dict):
-                        if "total" in ally:
-                            casualties += int(ally.get("total") or 0)
-                        else:
-                            casualties += sum(int(v or 0) for v in ally.values() if isinstance(v, (int, float)))
-                if casualties > 0:
-                    pop_next = max(0, pop_next - min(int(pop_now * 0.01), casualties))
-            except Exception:
-                pass
-
-            pop_next = max(0, pop_next)
+            pop_next = max(0, int(round(pop_now * surv)))
             sb.table("population_state").upsert({"week": next_week, "population": pop_next}, on_conflict="week").execute()
         except Exception:
             pass
