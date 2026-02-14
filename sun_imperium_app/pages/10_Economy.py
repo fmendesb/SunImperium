@@ -11,12 +11,48 @@ sidebar("📊 Economy")
 
 sb = get_supabase()
 ensure_bootstrap(sb)
-week = get_current_week(sb)
+current_week = get_current_week(sb)
 
 st.title("📊 Economy")
-st.caption(f"Week {week} · Prices, quantities, and who controls what")
+st.caption("Prices, quantities, and who controls what")
 
-# Load item catalog
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+# When you Advance Week, the economy is computed for the *closing* week, then current_week increments.
+# So the newest computed week is usually (current_week - 1).
+def _latest_computed_week() -> int:
+    try:
+        r = (
+            sb.table("economy_week_summary")
+            .select("week")
+            .order("week", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if r:
+            return _safe_int(r[0].get("week"), max(1, current_week - 1))
+    except Exception:
+        pass
+    return max(1, current_week - 1)
+
+latest = _latest_computed_week()
+max_week = max(current_week, latest)
+
+week = st.selectbox("Week to view", options=list(range(1, max_week + 1)), index=max(0, latest - 1))
+st.caption(f"Viewing Week {week} (current week is {current_week})")
+
 items = (
     sb.table("gathering_items")
     .select("name,tier,rarity,base_price_gp,vendor_price_gp,sale_price_gp,region,family")
@@ -27,7 +63,6 @@ items = (
     or []
 )
 
-# Load latest computed weekly output (if week hasn't been computed yet, table may be empty)
 out = (
     sb.table("economy_week_output")
     .select("item_name,qty,effective_price,gross_value,region,family")
@@ -36,6 +71,7 @@ out = (
     .data
     or []
 )
+
 by_name = {r.get("item_name"): r for r in out if r.get("item_name")}
 
 rows = []
@@ -43,17 +79,16 @@ for it in items:
     name = (it.get("name") or "").strip()
     if not name:
         continue
-
     price = it.get("base_price_gp") or it.get("vendor_price_gp") or it.get("sale_price_gp") or 0
-    base_price = float(price or 0)
+    base_price = _safe_float(price, 0.0)
 
     o = by_name.get(name) or {}
-    current_price = float(o.get("effective_price") or 0)
-    qty = int(o.get("qty") or 0)
+    current_price = _safe_float(o.get("effective_price"), 0.0)
+    qty = _safe_int(o.get("qty"), 0)
 
     rows.append(
         {
-            "Tier": int(it.get("tier") or 1),
+            "Tier": _safe_int(it.get("tier"), 1),
             "Rarity": (it.get("rarity") or "Common"),
             "Item": name,
             "Baseline price (gp)": base_price,
@@ -66,7 +101,6 @@ for it in items:
 
 df = pd.DataFrame(rows)
 
-# Filters
 c1, c2, c3 = st.columns(3)
 with c1:
     tier_sel = st.multiselect("Tier", sorted(df["Tier"].unique().tolist()), default=[])
@@ -85,7 +119,8 @@ if q_only:
 
 st.dataframe(f, use_container_width=True, hide_index=True)
 
-st.caption(
-    "Tip: Prices and quantities show after the week economy is computed (Advance Week). "
-    "If everything is 0, advance once or check that economy_week_output has rows for this week."
-)
+if not out:
+    st.info(
+        "No economy output rows for this week yet. "
+        "If you just advanced the week, switch the selector to the previous week."
+    )
